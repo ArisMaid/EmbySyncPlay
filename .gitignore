@@ -1,0 +1,17 @@
+**/bin/
+**/obj/
+.vs/
+.idea/
+dist/
+config/
+output/playwright/
+.playwright-cli/
+release/
+测试用媒体文件/
+测试用strm文件/
+media/*
+!media/.gitkeep
+strm/*
+!strm/.gitkeep
+*.user
+*.suo

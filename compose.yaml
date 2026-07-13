@@ -1,0 +1,28 @@
+services:
+  emby:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: emby-syncplay:4.9.3.0
+    container_name: emby-syncplay
+    restart: unless-stopped
+    ports:
+      - "8096:8096"
+      - "8920:8920"
+    environment:
+      UID: "0"
+      GID: "0"
+      GIDLIST: "0"
+    volumes:
+      - syncplay-config:/config
+      - type: bind
+        source: ${EMBY_MEDIA_PATH:-./media}
+        target: /media/local
+        read_only: true
+      - type: bind
+        source: ${EMBY_STRM_PATH:-./strm}
+        target: /media/strm
+        read_only: true
+
+volumes:
+  syncplay-config:

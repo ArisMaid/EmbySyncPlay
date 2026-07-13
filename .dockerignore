@@ -1,0 +1,12 @@
+**/bin
+**/obj
+.git
+.vs
+.idea
+config
+dist
+output
+测试用媒体文件
+测试用strm文件
+*.user
+

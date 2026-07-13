@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <AssemblyName>Emby.SyncPlay</AssemblyName>
+    <RootNamespace>Emby.SyncPlay</RootNamespace>
+    <Version>1.5.0</Version>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <AppendTargetFrameworkToOutputPath>true</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="MediaBrowser.Server.Core" Version="4.9.1.90" />
+    <PackageReference Include="System.Memory" Version="4.6.0">
+      <IncludeAssets>compile</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Web\client.js" LogicalName="Emby.SyncPlay.Web.client.js" />
+    <EmbeddedResource Include="Web\client.css" LogicalName="Emby.SyncPlay.Web.client.css" />
+    <EmbeddedResource Include="Web\config.html" LogicalName="Emby.SyncPlay.Web.config.html" />
+    <EmbeddedResource Include="Web\config.js" LogicalName="Emby.SyncPlay.Web.config.js" />
+  </ItemGroup>
+</Project>
