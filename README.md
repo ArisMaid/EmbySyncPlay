@@ -14,8 +14,8 @@
 
 从 [Releases](../../releases) 下载：
 
-- `Emby.SyncPlay.dll`：复制到 Emby 的插件目录并重启服务。
-- `EmbySyncPlay-1.5.0-amilys.zip`：适用于 `amilys/embyserver`，包含 DLL、Web 加载器和安装说明。
+- `EmbySyncPlay-1.5.4-amilys.zip`：推荐安装包，包含 DLL、Web 加载器和安装说明。
+- `Emby.SyncPlay.dll`：仅服务端组件，适用于已单独配置 Web 加载器的环境。
 
 Docker 用户也可直接构建：
 
@@ -36,4 +36,4 @@ node --test tests/client-observer.test.js
 
 ## 当前版本
 
-`1.5.0`
+`1.5.4`

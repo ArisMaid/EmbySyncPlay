@@ -8,6 +8,8 @@
 
     const TICKS_PER_SECOND = 10000000;
     const MENU_AUTO_CLOSE_MS = 5000;
+    const UI_CONTENT_RENDER_INTERVAL_MS = 500;
+    const surfaceMarkupCache = new WeakMap();
     const state = {
         apiClient: null,
         room: null,
@@ -33,11 +35,24 @@
         videoCleanup: null,
         suppressUntil: 0,
         drawerOpen: false,
+        activeDrawerClass: null,
+        activeDrawerElement: null,
         lastFocused: null,
         drawerAutoCloseTimer: null,
+        drawerFocusTimer: null,
+        drawerFocusGeneration: 0,
         headerMenuOpen: false,
         headerLastFocused: null,
         headerAutoCloseTimer: null,
+        headerFocusTimer: null,
+        headerFocusGeneration: 0,
+        headerPositionFrame: null,
+        contentRenderTimer: null,
+        lastContentRenderAt: 0,
+        surfacePointerDown: false,
+        pointerReleaseFrame: null,
+        contentRenderPendingWhileInteracting: false,
+        surfaceActionPending: 0,
         heartbeatTimer: null,
         clockTimer: null,
         pendingCommand: null,
@@ -53,7 +68,8 @@
         nudgeTimer: null,
         connectionOnline: true,
         activeParticipant: false,
-        mutationObserver: null
+        mutationObserver: null,
+        observerFrame: null
     };
 
     const text = {
@@ -101,7 +117,7 @@
         const link = document.createElement("link");
         link.id = "syncPlay-client-css";
         link.rel = "stylesheet";
-        link.href = "/web/configurationpage?name=syncplayclientcss&v=1.5.0";
+        link.href = "/web/configurationpage?name=syncplayclientcss&v=1.5.4";
         document.head.appendChild(link);
     }
 
@@ -120,10 +136,53 @@
         });
     }
 
+    function eventPathContains(event, selector) {
+        const path = event && typeof event.composedPath === "function" ? event.composedPath() : [];
+        if (path.some(function (node) {
+            return node && node.matches && node.matches(selector);
+        })) {
+            return true;
+        }
+        const target = event && event.target;
+        return Boolean(target && target.closest && target.closest(selector));
+    }
+
+    function releaseSurfacePointerAfterClick() {
+        window.cancelAnimationFrame(state.pointerReleaseFrame);
+        state.pointerReleaseFrame = window.requestAnimationFrame(function () {
+            state.pointerReleaseFrame = null;
+            releaseSurfacePointerNow();
+        });
+    }
+
+    function releaseSurfacePointerNow() {
+        window.cancelAnimationFrame(state.pointerReleaseFrame);
+        state.pointerReleaseFrame = null;
+        state.surfacePointerDown = false;
+        if (state.contentRenderPendingWhileInteracting && !state.surfaceActionPending) {
+            state.contentRenderPendingWhileInteracting = false;
+            renderSurfaceContents();
+        }
+    }
+
     function startObservers() {
-        state.mutationObserver = new MutationObserver(function () {
-            mountPlayerUi();
-            bindCurrentVideo();
+        state.mutationObserver = new MutationObserver(function (mutations) {
+            const hasExternalMutation = !mutations || mutations.some(function (mutation) {
+                const target = mutation && mutation.target;
+                return !target || !target.closest ||
+                    !target.closest(".syncPlay-panel, .syncPlay-headerPanel, .syncPlay-controlButton, .syncPlay-toast");
+            });
+            if (!hasExternalMutation) {
+                return;
+            }
+            if (state.observerFrame) {
+                return;
+            }
+            state.observerFrame = window.requestAnimationFrame(function () {
+                state.observerFrame = null;
+                mountPlayerUi();
+                bindCurrentVideo();
+            });
         });
         state.mutationObserver.observe(document.body, { childList: true, subtree: true });
         document.addEventListener("viewbeforeshow", mountPlayerUi);
@@ -133,11 +192,8 @@
             }
         });
         document.addEventListener("click", function (event) {
-            const target = event.target;
-            const insideHeader = target && target.closest &&
-                target.closest(".syncPlay-headerPanel, .syncPlay-headerButton");
-            const insideDrawer = target && target.closest &&
-                target.closest(".syncPlay-panel, .syncPlay-osdButton, .syncPlay-barButton");
+            const insideHeader = eventPathContains(event, ".syncPlay-headerPanel, .syncPlay-headerButton");
+            const insideDrawer = eventPathContains(event, ".syncPlay-panel, .syncPlay-osdButton, .syncPlay-barButton");
 
             if (state.headerMenuOpen) {
                 if (insideHeader) {
@@ -163,8 +219,45 @@
                 resetDrawerAutoClose();
             }
         }, true);
-        window.addEventListener("resize", positionHeaderPanel);
-        document.addEventListener("scroll", positionHeaderPanel, true);
+        document.addEventListener("pointerdown", function (event) {
+            window.cancelAnimationFrame(state.pointerReleaseFrame);
+            state.pointerReleaseFrame = null;
+            const insideHeader = eventPathContains(event, ".syncPlay-headerPanel");
+            const insideDrawer = eventPathContains(event, ".syncPlay-panel");
+            state.surfacePointerDown = Boolean(insideHeader || insideDrawer);
+            if (insideHeader) {
+                resetHeaderAutoClose();
+            }
+            if (insideDrawer) {
+                resetDrawerAutoClose();
+            }
+        }, true);
+        document.addEventListener("pointerup", releaseSurfacePointerAfterClick, true);
+        document.addEventListener("pointercancel", releaseSurfacePointerAfterClick, true);
+        window.addEventListener("blur", releaseSurfacePointerNow);
+        ["wheel", "touchmove", "focusin"].forEach(function (eventName) {
+            document.addEventListener(eventName, function (event) {
+                if (eventPathContains(event, ".syncPlay-headerPanel")) {
+                    resetHeaderAutoClose();
+                }
+                if (eventPathContains(event, ".syncPlay-panel")) {
+                    resetDrawerAutoClose();
+                }
+            }, true);
+        });
+        window.addEventListener("resize", scheduleHeaderPosition);
+        document.addEventListener("scroll", function (event) {
+            const target = event.target;
+            if (target && target.closest && target.closest(".syncPlay-headerPanel")) {
+                resetHeaderAutoClose();
+                return;
+            }
+            if (target && target.closest && target.closest(".syncPlay-panel")) {
+                resetDrawerAutoClose();
+                return;
+            }
+            scheduleHeaderPosition();
+        }, true);
         document.addEventListener("keydown", function (event) {
             if (event.key === "Escape") {
                 if (state.headerMenuOpen) {
@@ -207,60 +300,72 @@
             mounted = true;
         }
 
-        const topRight = document.querySelector(".videoOsdBottom-buttons-topright");
-        if (topRight && !topRight.querySelector(".syncPlay-osdButton")) {
-            const button = createPlayerButton("syncPlay-osdButton");
-            const settings = topRight.querySelector(".btnVideoOsdSettings");
-            topRight.insertBefore(button, settings || null);
-            mounted = true;
-        }
+        document.querySelectorAll(".videoOsdBottom-buttons-topright").forEach(function (topRight) {
+            if (!topRight.querySelector(".syncPlay-osdButton")) {
+                const button = createPlayerButton("syncPlay-osdButton");
+                const settings = topRight.querySelector(".btnVideoOsdSettings");
+                topRight.insertBefore(button, settings || null);
+                mounted = true;
+            }
+        });
 
-        const mainControls = document.querySelector(".videoOsdBottom-maincontrols");
-        if (mainControls && !mainControls.querySelector(".syncPlay-drawer")) {
-            const drawer = createDrawer("syncPlay-drawer");
-            mainControls.insertBefore(drawer, mainControls.firstElementChild);
-            mounted = true;
-        }
+        document.querySelectorAll(".videoOsdBottom-maincontrols").forEach(function (mainControls) {
+            if (!mainControls.querySelector(".syncPlay-drawer")) {
+                const drawer = createDrawer("syncPlay-drawer");
+                mainControls.insertBefore(drawer, mainControls.firstElementChild);
+                mounted = true;
+            }
+        });
 
-        const nowPlayingRight = document.querySelector(".nowPlayingBarRight");
-        if (nowPlayingRight && !nowPlayingRight.querySelector(".syncPlay-barButton")) {
-            nowPlayingRight.insertBefore(createPlayerButton("syncPlay-barButton"), nowPlayingRight.firstElementChild);
-            mounted = true;
-        }
+        document.querySelectorAll(".nowPlayingBarRight").forEach(function (nowPlayingRight) {
+            if (!nowPlayingRight.querySelector(".syncPlay-barButton")) {
+                nowPlayingRight.insertBefore(createPlayerButton("syncPlay-barButton"), nowPlayingRight.firstElementChild);
+                mounted = true;
+            }
+        });
 
-        const nowPlayingBar = document.querySelector(".nowPlayingBar");
-        if (nowPlayingBar && !nowPlayingBar.querySelector(".syncPlay-miniDrawer")) {
-            nowPlayingBar.appendChild(createDrawer("syncPlay-miniDrawer"));
-            mounted = true;
-        }
+        document.querySelectorAll(".nowPlayingBar").forEach(function (nowPlayingBar) {
+            if (!nowPlayingBar.querySelector(".syncPlay-miniDrawer")) {
+                nowPlayingBar.appendChild(createDrawer("syncPlay-miniDrawer"));
+                mounted = true;
+            }
+        });
         if (mounted) {
-            renderAll();
+            renderAll(true);
         }
         return mounted;
     }
 
+    function createPaperIconButton() {
+        let button;
+        try {
+            button = document.createElement("button", { is: "paper-icon-button-light" });
+        } catch (error) {
+            button = document.createElement("button");
+        }
+        button.setAttribute("is", "paper-icon-button-light");
+        return button;
+    }
+
     function createPlayerButton(extraClass) {
-        const button = document.createElement("button");
+        const button = createPaperIconButton();
         button.type = "button";
         button.className = "osdIconButton paper-icon-button-light syncPlay-controlButton " + extraClass;
-        button.setAttribute("is", "paper-icon-button-light");
         button.innerHTML = [
             '<i class="md-icon osdIconButton-icon syncPlay-buttonIcon">&#xe7fb;</i>',
             '<span class="syncPlay-memberBadge" aria-hidden="true"></span>'
         ].join("");
         button.addEventListener("click", function (event) {
             event.preventDefault();
-            event.stopPropagation();
-            toggleDrawer(button);
+            toggleDrawer(button, event.detail === 0);
         });
         return button;
     }
 
     function createHeaderButton() {
-        const button = document.createElement("button");
+        const button = createPaperIconButton();
         button.type = "button";
         button.className = "headerButton headerSectionItem paper-icon-button-light syncPlay-controlButton syncPlay-headerButton";
-        button.setAttribute("is", "paper-icon-button-light");
         button.innerHTML = [
             '<i class="md-icon syncPlay-buttonIcon">&#xe7fb;</i>',
             '<span class="syncPlay-memberBadge" aria-hidden="true"></span>'
@@ -268,28 +373,30 @@
         button.addEventListener("click", function (event) {
             event.preventDefault();
             event.stopPropagation();
-            toggleHeaderMenu(button);
+            toggleHeaderMenu(button, event.detail === 0);
         });
         return button;
     }
 
     function createHeaderPanel() {
         const panel = document.createElement("section");
-        panel.className = "syncPlay-headerPanel hide";
+        panel.className = "syncPlay-headerPanel";
         panel.setAttribute("aria-label", "快速加入同步房间");
-        panel.setAttribute("aria-live", "polite");
+        panel.setAttribute("aria-hidden", "true");
+        panel.inert = true;
         return panel;
     }
 
     function createDrawer(extraClass) {
         const drawer = document.createElement("section");
-        drawer.className = "syncPlay-panel osdContentSection hide " + extraClass;
+        drawer.className = "syncPlay-panel osdContentSection " + extraClass;
         drawer.setAttribute("aria-label", text.title);
-        drawer.setAttribute("aria-live", "polite");
+        drawer.setAttribute("aria-hidden", "true");
+        drawer.inert = true;
         return drawer;
     }
 
-    function toggleDrawer(source) {
+    function toggleDrawer(source, focusOnOpen) {
         if (state.drawerOpen) {
             closeDrawer();
             return;
@@ -297,12 +404,23 @@
         if (state.headerMenuOpen) {
             closeHeaderMenu(false);
         }
+        window.clearTimeout(state.drawerFocusTimer);
+        state.drawerFocusTimer = null;
+        state.drawerFocusGeneration += 1;
+        const focusGeneration = state.drawerFocusGeneration;
+        state.activeDrawerElement = getDrawerElementForSource(source) || getDefaultDrawerElement();
+        state.activeDrawerClass = getDrawerClassForSource(source);
         state.drawerOpen = true;
         state.lastFocused = source;
-        renderAll();
+        setOsdInteractionLock(state.activeDrawerClass === "syncPlay-drawer");
+        renderAll(true);
         resetDrawerAutoClose();
-        window.setTimeout(function () {
-            if (!state.drawerOpen) {
+        if (!focusOnOpen) {
+            return;
+        }
+        state.drawerFocusTimer = window.setTimeout(function () {
+            state.drawerFocusTimer = null;
+            if (!state.drawerOpen || focusGeneration !== state.drawerFocusGeneration) {
                 return;
             }
             const target = getVisibleDrawer();
@@ -310,18 +428,22 @@
             if (focusable) {
                 focusable.focus();
             }
-        }, 30);
+        }, getSurfaceFocusDelay());
     }
 
     function closeDrawer(restoreFocus) {
         window.clearTimeout(state.drawerAutoCloseTimer);
         state.drawerAutoCloseTimer = null;
+        window.clearTimeout(state.drawerFocusTimer);
+        state.drawerFocusTimer = null;
+        state.drawerFocusGeneration += 1;
+        moveFocusBeforeClose(".syncPlay-panel", state.lastFocused, restoreFocus);
         state.drawerOpen = false;
-        renderAll();
-        if (restoreFocus !== false && state.lastFocused && document.contains(state.lastFocused)) {
-            state.lastFocused.focus();
-        }
+        setOsdInteractionLock(false);
+        updateSurfaceVisibility();
         state.lastFocused = null;
+        state.activeDrawerClass = null;
+        state.activeDrawerElement = null;
     }
 
     function resetDrawerAutoClose() {
@@ -330,12 +452,16 @@
         if (state.drawerOpen) {
             state.drawerAutoCloseTimer = window.setTimeout(function () {
                 state.drawerAutoCloseTimer = null;
+                if (state.surfacePointerDown || state.surfaceActionPending) {
+                    resetDrawerAutoClose();
+                    return;
+                }
                 closeDrawer(false);
             }, MENU_AUTO_CLOSE_MS);
         }
     }
 
-    function toggleHeaderMenu(source) {
+    function toggleHeaderMenu(source, focusOnOpen) {
         if (state.headerMenuOpen) {
             closeHeaderMenu();
             return;
@@ -343,30 +469,38 @@
         if (state.drawerOpen) {
             closeDrawer(false);
         }
+        window.clearTimeout(state.headerFocusTimer);
+        state.headerFocusTimer = null;
+        state.headerFocusGeneration += 1;
+        const focusGeneration = state.headerFocusGeneration;
         state.headerMenuOpen = true;
         state.headerLastFocused = source;
-        renderAll();
-        positionHeaderPanel();
+        renderAll(true);
         resetHeaderAutoClose();
-        window.setTimeout(function () {
-            if (!state.headerMenuOpen) {
+        if (!focusOnOpen) {
+            return;
+        }
+        state.headerFocusTimer = window.setTimeout(function () {
+            state.headerFocusTimer = null;
+            if (!state.headerMenuOpen || focusGeneration !== state.headerFocusGeneration) {
                 return;
             }
-            const input = document.querySelector(".syncPlay-headerPanel:not(.hide) input");
+            const input = document.querySelector(".syncPlay-headerPanel.syncPlay-surfaceOpen input");
             if (input) {
                 input.focus();
             }
-        }, 30);
+        }, getSurfaceFocusDelay());
     }
 
     function closeHeaderMenu(restoreFocus) {
         window.clearTimeout(state.headerAutoCloseTimer);
         state.headerAutoCloseTimer = null;
+        window.clearTimeout(state.headerFocusTimer);
+        state.headerFocusTimer = null;
+        state.headerFocusGeneration += 1;
+        moveFocusBeforeClose(".syncPlay-headerPanel", state.headerLastFocused, restoreFocus);
         state.headerMenuOpen = false;
-        renderAll();
-        if (restoreFocus !== false && state.headerLastFocused && document.contains(state.headerLastFocused)) {
-            state.headerLastFocused.focus();
-        }
+        updateSurfaceVisibility();
         state.headerLastFocused = null;
     }
 
@@ -376,9 +510,82 @@
         if (state.headerMenuOpen) {
             state.headerAutoCloseTimer = window.setTimeout(function () {
                 state.headerAutoCloseTimer = null;
+                if (state.surfacePointerDown || state.surfaceActionPending) {
+                    resetHeaderAutoClose();
+                    return;
+                }
                 closeHeaderMenu(false);
             }, MENU_AUTO_CLOSE_MS);
         }
+    }
+
+    function getSurfaceFocusDelay() {
+        return window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 220;
+    }
+
+    function moveFocusBeforeClose(surfaceSelector, returnTarget, restoreFocus) {
+        const activeElement = document.activeElement;
+        const activeInside = activeElement && activeElement.closest && activeElement.closest(surfaceSelector);
+        if (restoreFocus !== false && returnTarget && document.contains(returnTarget)) {
+            returnTarget.focus();
+            return;
+        }
+        if (activeInside && activeElement.blur) {
+            activeElement.blur();
+        }
+    }
+
+    function getDrawerClassForSource(source) {
+        const drawer = getDrawerElementForSource(source) || getDefaultDrawerElement();
+        return drawer && drawer.classList.contains("syncPlay-miniDrawer")
+            ? "syncPlay-miniDrawer"
+            : "syncPlay-drawer";
+    }
+
+    function getDrawerElementForSource(source) {
+        if (!source || !source.closest) {
+            return null;
+        }
+        if (source.classList.contains("syncPlay-barButton")) {
+            const bar = source.closest(".nowPlayingBar");
+            return bar && bar.querySelector(".syncPlay-miniDrawer");
+        }
+        const osd = source.closest(".videoOsdBottom");
+        return osd && osd.querySelector(".syncPlay-drawer");
+    }
+
+    function getDefaultDrawerElement() {
+        const activeVideoView = document.querySelector(".view-videoosd-videoosd:not(.hide)");
+        const activeOsdDrawer = activeVideoView && activeVideoView.querySelector(".syncPlay-drawer");
+        if (activeOsdDrawer) {
+            return activeOsdDrawer;
+        }
+        const visibleBar = Array.prototype.find.call(document.querySelectorAll(".nowPlayingBar"), function (bar) {
+            return bar.offsetParent !== null && !bar.classList.contains("hide");
+        });
+        if (visibleBar) {
+            return visibleBar.querySelector(".syncPlay-miniDrawer");
+        }
+        return document.querySelector(".syncPlay-drawer, .syncPlay-miniDrawer");
+    }
+
+    function setOsdInteractionLock(locked) {
+        const activeOsd = state.activeDrawerElement && state.activeDrawerElement.closest
+            ? state.activeDrawerElement.closest(".videoOsdBottom")
+            : null;
+        document.querySelectorAll(".videoOsdBottom").forEach(function (osd) {
+            osd.classList.toggle("syncPlay-osdLocked", Boolean(locked && osd === activeOsd));
+        });
+    }
+
+    function scheduleHeaderPosition() {
+        if (!state.headerMenuOpen || state.headerPositionFrame) {
+            return;
+        }
+        state.headerPositionFrame = window.requestAnimationFrame(function () {
+            state.headerPositionFrame = null;
+            positionHeaderPanel();
+        });
     }
 
     function positionHeaderPanel() {
@@ -386,7 +593,7 @@
             return;
         }
         const button = document.querySelector(".syncPlay-headerButton");
-        const panel = document.querySelector("body > .syncPlay-headerPanel:not(.hide)");
+        const panel = document.querySelector("body > .syncPlay-headerPanel.syncPlay-surfaceOpen");
         if (!button || !panel) {
             return;
         }
@@ -402,30 +609,116 @@
     }
 
     function getVisibleDrawer() {
-        const osdDrawer = document.querySelector(".syncPlay-drawer");
-        if (osdDrawer && osdDrawer.offsetParent !== null) {
-            return osdDrawer;
+        if (state.activeDrawerElement && state.activeDrawerElement.isConnected &&
+            state.activeDrawerElement.classList.contains("syncPlay-surfaceOpen")) {
+            return state.activeDrawerElement;
         }
-        return document.querySelector(".syncPlay-miniDrawer");
+        const activeClass = state.activeDrawerClass || "syncPlay-drawer";
+        return document.querySelector("." + activeClass + ".syncPlay-surfaceOpen");
     }
 
-    function renderAll() {
+    function setSurfaceOpen(surface, open) {
+        const changed = surface.classList.contains("syncPlay-surfaceOpen") !== open;
+        if (open) {
+            surface.inert = false;
+            surface.setAttribute("aria-hidden", "false");
+            surface.classList.add("syncPlay-surfaceOpen");
+        } else {
+            surface.inert = true;
+            surface.setAttribute("aria-hidden", "true");
+            surface.classList.remove("syncPlay-surfaceOpen");
+        }
+        return changed;
+    }
+
+    function updateSurfaceVisibility() {
+        const activeDrawerClass = state.activeDrawerClass || getDrawerClassForSource(null);
+        if (state.drawerOpen && (!state.activeDrawerElement || !state.activeDrawerElement.isConnected)) {
+            state.activeDrawerElement = getDefaultDrawerElement();
+        }
         document.querySelectorAll(".syncPlay-panel").forEach(function (panel) {
-            panel.classList.toggle("hide", !state.drawerOpen);
-            panel.innerHTML = state.room ? renderRoom() : renderLobby();
-            bindPanelActions(panel);
+            const isActiveDrawer = state.activeDrawerElement
+                ? panel === state.activeDrawerElement
+                : panel.classList.contains(activeDrawerClass);
+            setSurfaceOpen(panel, state.drawerOpen && isActiveDrawer);
         });
+        let headerVisibilityChanged = false;
         document.querySelectorAll(".syncPlay-headerPanel").forEach(function (panel) {
-            panel.classList.toggle("hide", !state.headerMenuOpen);
-            if (state.headerMenuOpen) {
-                panel.innerHTML = renderHeaderMenu();
-                bindHeaderActions(panel);
-            } else {
-                panel.innerHTML = "";
-            }
+            headerVisibilityChanged = setSurfaceOpen(panel, state.headerMenuOpen) || headerVisibilityChanged;
         });
-        positionHeaderPanel();
+        const osdDrawerActive = state.activeDrawerElement
+            ? state.activeDrawerElement.classList.contains("syncPlay-drawer")
+            : activeDrawerClass === "syncPlay-drawer";
+        setOsdInteractionLock(state.drawerOpen && osdDrawerActive);
+        if (state.headerMenuOpen && headerVisibilityChanged) {
+            scheduleHeaderPosition();
+        }
         updatePlayerButtons();
+    }
+
+    function updateSurfaceMarkup(surface, markup, bindActions) {
+        if (surfaceMarkupCache.get(surface) === markup) {
+            return false;
+        }
+        const scrollTop = surface.scrollTop;
+        surface.innerHTML = markup;
+        surfaceMarkupCache.set(surface, markup);
+        bindActions(surface);
+        surface.scrollTop = scrollTop;
+        return true;
+    }
+
+    function renderSurfaceContents() {
+        if (state.surfacePointerDown || state.surfaceActionPending) {
+            state.contentRenderPendingWhileInteracting = true;
+            return;
+        }
+        state.contentRenderPendingWhileInteracting = false;
+        if (state.drawerOpen) {
+            const drawerMarkup = state.room ? renderRoom() : renderLobby();
+            const drawer = getVisibleDrawer();
+            if (drawer) {
+                updateSurfaceMarkup(drawer, drawerMarkup, bindPanelActions);
+            }
+        }
+        if (state.headerMenuOpen) {
+            const headerMarkup = renderHeaderMenu();
+            let headerChanged = false;
+            document.querySelectorAll(".syncPlay-headerPanel").forEach(function (panel) {
+                headerChanged = updateSurfaceMarkup(panel, headerMarkup, bindHeaderActions) || headerChanged;
+            });
+            if (headerChanged) {
+                scheduleHeaderPosition();
+            }
+        }
+        state.lastContentRenderAt = performance.now();
+    }
+
+    function scheduleSurfaceContentRender(delay) {
+        if (state.contentRenderTimer) {
+            return;
+        }
+        state.contentRenderTimer = window.setTimeout(function () {
+            state.contentRenderTimer = null;
+            renderSurfaceContents();
+        }, Math.max(0, delay));
+    }
+
+    function renderAll(immediateContent) {
+        updateSurfaceVisibility();
+        if (!state.drawerOpen && !state.headerMenuOpen) {
+            window.clearTimeout(state.contentRenderTimer);
+            state.contentRenderTimer = null;
+            return;
+        }
+        if (immediateContent !== false) {
+            window.clearTimeout(state.contentRenderTimer);
+            state.contentRenderTimer = null;
+            renderSurfaceContents();
+            return;
+        }
+        const elapsed = performance.now() - state.lastContentRenderAt;
+        scheduleSurfaceContentRender(UI_CONTENT_RENDER_INTERVAL_MS - elapsed);
     }
 
     function renderLobby() {
@@ -580,9 +873,9 @@
 
     function bindHeaderActions(panel) {
         bindClick(panel, ".syncPlay-headerCloseButton", closeHeaderMenu);
-        bindClick(panel, ".syncPlay-headerJoinButton", function () {
+        bindClick(panel, ".syncPlay-headerJoinButton", function (source) {
             const input = panel.querySelector(".syncPlay-headerCodeInput");
-            joinRoom(input ? input.value : "", { openPlayback: true });
+            joinRoom(input ? input.value : "", { openPlayback: true }, source);
         });
         bindClick(panel, ".syncPlay-headerOpenButton", function () {
             openRoomPlayback(state.room);
@@ -598,7 +891,7 @@
             });
             input.addEventListener("keydown", function (event) {
                 if (event.key === "Enter") {
-                    joinRoom(input.value, { openPlayback: true });
+                    joinRoom(input.value, { openPlayback: true }, panel.querySelector(".syncPlay-headerJoinButton"));
                 }
             });
         }
@@ -607,9 +900,9 @@
     function bindPanelActions(panel) {
         bindClick(panel, ".syncPlay-closeButton", closeDrawer);
         bindClick(panel, ".syncPlay-createButton", createRoom);
-        bindClick(panel, ".syncPlay-joinButton", function () {
+        bindClick(panel, ".syncPlay-joinButton", function (source) {
             const input = panel.querySelector(".syncPlay-codeInput");
-            joinRoom(input ? input.value : "");
+            joinRoom(input ? input.value : "", null, source);
         });
         bindClick(panel, ".syncPlay-leaveButton", leaveRoom);
         bindClick(panel, ".syncPlay-closeRoomButton", closeRoom);
@@ -621,7 +914,7 @@
             });
             input.addEventListener("keydown", function (event) {
                 if (event.key === "Enter") {
-                    joinRoom(input.value);
+                    joinRoom(input.value, null, panel.querySelector(".syncPlay-joinButton"));
                 }
             });
         }
@@ -632,12 +925,45 @@
         if (element) {
             element.addEventListener("click", function (event) {
                 event.preventDefault();
-                handler();
+                handler(element, event);
             });
         }
     }
 
-    async function createRoom() {
+    function setActionPending(element, pending) {
+        if (!element) {
+            return;
+        }
+        const wasPending = element.getAttribute("aria-busy") === "true";
+        if (pending && !wasPending) {
+            state.surfaceActionPending += 1;
+        } else if (!pending && wasPending) {
+            state.surfaceActionPending = Math.max(0, state.surfaceActionPending - 1);
+        }
+        element.disabled = pending;
+        element.classList.toggle("syncPlay-menuButton-pending", pending);
+        if (pending) {
+            element.setAttribute("aria-busy", "true");
+        } else {
+            element.removeAttribute("aria-busy");
+        }
+        if (element.closest && element.closest(".syncPlay-headerPanel")) {
+            resetHeaderAutoClose();
+        }
+        if (element.closest && element.closest(".syncPlay-panel")) {
+            resetDrawerAutoClose();
+        }
+        if (!pending && !state.surfaceActionPending &&
+            (state.contentRenderPendingWhileInteracting || state.contentRenderTimer)) {
+            window.clearTimeout(state.contentRenderTimer);
+            state.contentRenderTimer = null;
+            state.contentRenderPendingWhileInteracting = false;
+            renderAll(true);
+        }
+    }
+
+    async function createRoom(source) {
+        setActionPending(source, true);
         setPanelMessage("正在创建房间…");
         try {
             const video = state.video;
@@ -649,15 +975,18 @@
             startRealtime();
         } catch (error) {
             showError(error);
+        } finally {
+            setActionPending(source, false);
         }
     }
 
-    async function joinRoom(code, options) {
+    async function joinRoom(code, options, source) {
         code = String(code || "").trim();
         if (!/^[0-9]{3}$/.test(code)) {
             setPanelMessage("请输入完整的 3 位数字房间码。", true);
             return;
         }
+        setActionPending(source, true);
         setPanelMessage(text.joining);
         try {
             const result = await apiRequest("SyncPlay/Rooms/" + encodeURIComponent(code) + "/Join", "POST", {});
@@ -670,6 +999,8 @@
             }
         } catch (error) {
             showError(error);
+        } finally {
+            setActionPending(source, false);
         }
     }
 
@@ -843,7 +1174,9 @@
         state.transitionTicker = null;
         const transition = getValue(state.room, "MediaTransitionState", "mediaTransitionState") || "None";
         if (transition === "AwaitingHostPlayback") {
-            state.transitionTicker = window.setInterval(renderAll, 1000);
+            state.transitionTicker = window.setInterval(function () {
+                renderAll(false);
+            }, 1000);
         }
     }
 
@@ -1065,7 +1398,7 @@
             state.mediaSwitchLoading = false;
         }
         updateTransitionTicker();
-        renderAll();
+        renderAll(false);
     }
 
     function normalizeData(data) {
@@ -1511,7 +1844,16 @@
                 : (isHeaderButton ? "快速加入同步房间" : text.title);
             button.title = label;
             button.setAttribute("aria-label", label);
-            button.setAttribute("aria-expanded", (isHeaderButton ? state.headerMenuOpen : state.drawerOpen) ? "true" : "false");
+            const buttonDrawerClass = button.classList.contains("syncPlay-barButton")
+                ? "syncPlay-miniDrawer"
+                : "syncPlay-drawer";
+            const buttonDrawer = isHeaderButton ? null : getDrawerElementForSource(button);
+            const expanded = isHeaderButton
+                ? state.headerMenuOpen
+                : state.drawerOpen && (state.activeDrawerElement
+                    ? state.activeDrawerElement === buttonDrawer
+                    : state.activeDrawerClass === buttonDrawerClass);
+            button.setAttribute("aria-expanded", expanded ? "true" : "false");
         });
     }
 
@@ -1553,7 +1895,10 @@
     async function handleInviteFragment() {
         const code = getInviteCode();
         if (code && !state.room) {
+            state.activeDrawerElement = getDefaultDrawerElement();
+            state.activeDrawerClass = getDrawerClassForSource(null);
             state.drawerOpen = true;
+            setOsdInteractionLock(state.activeDrawerClass === "syncPlay-drawer");
             renderAll();
             resetDrawerAutoClose();
             await joinRoom(code);
@@ -1607,18 +1952,44 @@
         setPanelMessage(message, isError);
         const previous = document.querySelector(".syncPlay-toast");
         if (previous) {
-            previous.remove();
+            dismissNotice(previous);
         }
         const toast = document.createElement("div");
         toast.className = "syncPlay-toast" + (isError ? " syncPlay-toast-error" : "");
         toast.setAttribute("role", "status");
         toast.textContent = message;
         document.body.appendChild(toast);
+        window.requestAnimationFrame(function () {
+            window.requestAnimationFrame(function () {
+                if (toast.parentNode) {
+                    toast.classList.add("syncPlay-toast-visible");
+                }
+            });
+        });
         window.setTimeout(function () {
+            dismissNotice(toast);
+        }, 4500);
+    }
+
+    function dismissNotice(toast) {
+        if (!toast || !toast.parentNode || toast.classList.contains("syncPlay-toast-dismissing")) {
+            return;
+        }
+        toast.classList.add("syncPlay-toast-dismissing");
+        toast.classList.remove("syncPlay-toast-visible");
+        const remove = function () {
+            toast.removeEventListener("transitionend", onTransitionEnd);
             if (toast.parentNode) {
                 toast.parentNode.removeChild(toast);
             }
-        }, 4500);
+        };
+        const onTransitionEnd = function (event) {
+            if (event.target === toast && event.propertyName === "transform") {
+                remove();
+            }
+        };
+        toast.addEventListener("transitionend", onTransitionEnd);
+        window.setTimeout(remove, 240);
     }
 
     function showError(error) {
