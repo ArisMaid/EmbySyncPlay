@@ -28,6 +28,7 @@
         mediaFallbackTimer: null,
         transitionTicker: null,
         clientSequence: 0,
+        clientInstanceId: null,
         clockOffsetMs: 0,
         clockSamples: [],
         clockRequests: new Map(),
@@ -55,6 +56,9 @@
         surfaceActionPending: 0,
         heartbeatTimer: null,
         clockTimer: null,
+        statusTimer: null,
+        statusPollInFlight: false,
+        statusPollFailures: 0,
         pendingCommand: null,
         lastLoadCommand: null,
         loadCommandExpiresAt: 0,
@@ -62,11 +66,13 @@
         localSeekInProgress: false,
         localSeekDeadline: 0,
         seekCommitUntil: 0,
+        localControlUntil: 0,
         programmaticSeekTarget: null,
         programmaticSeekUntil: 0,
         originalPlaybackRate: 1,
         nudgeTimer: null,
         connectionOnline: true,
+        websocketOnline: false,
         activeParticipant: false,
         mutationObserver: null,
         observerFrame: null
@@ -117,13 +123,14 @@
         const link = document.createElement("link");
         link.id = "syncPlay-client-css";
         link.rel = "stylesheet";
-        link.href = "/web/configurationpage?name=syncplayclientcss&v=1.5.5";
+        link.href = "/web/configurationpage?name=syncplayclientcss&v=1.5.6";
         document.head.appendChild(link);
     }
 
     function bindApiEvents() {
         window.Events.on(state.apiClient, "message", onServerMessage);
         window.Events.on(state.apiClient, "websocketopen", function () {
+            state.websocketOnline = true;
             state.connectionOnline = true;
             renderAll();
             if (state.memberToken) {
@@ -131,7 +138,9 @@
             }
         });
         window.Events.on(state.apiClient, "websocketclose", function () {
-            state.connectionOnline = false;
+            // The plugin events use HTTP.  A missing Emby WebSocket must not
+            // disable the HTTP polling/control fallback used by NAS proxies.
+            state.websocketOnline = false;
             renderAll();
         });
     }
@@ -1137,10 +1146,9 @@
 
     async function refreshStatus() {
         try {
-            const result = await apiRequest("SyncPlay/Status", "GET");
+            const result = await apiRequest(getStatusPath(), "GET");
             if (result && getValue(result, "Room", "room")) {
                 applyJoinResult(result);
-                state.activeParticipant = true;
                 startRealtime();
             }
         } catch (error) {
@@ -1150,7 +1158,12 @@
     }
 
     function applyJoinResult(result) {
-        state.memberToken = getValue(result, "MemberToken", "memberToken");
+        const nextToken = getValue(result, "MemberToken", "memberToken");
+        if (nextToken && nextToken !== state.memberToken) {
+            state.clientSequence = 0;
+            state.clientInstanceId = null;
+        }
+        state.memberToken = nextToken;
         state.heartbeatIntervalMs = Number(getValue(result, "HeartbeatIntervalMs", "heartbeatIntervalMs") || 250);
         state.softDriftMs = Number(getValue(result, "SoftDriftThresholdMs", "softDriftThresholdMs") || 80);
         state.hardDriftMs = Number(getValue(result, "HardDriftThresholdMs", "hardDriftThresholdMs") || 500);
@@ -1175,6 +1188,8 @@
         state.localSeekInProgress = false;
         state.localSeekDeadline = 0;
         state.seekCommitUntil = 0;
+        state.localControlUntil = 0;
+        state.clientInstanceId = null;
         state.programmaticSeekTarget = null;
         state.programmaticSeekUntil = 0;
         window.clearTimeout(state.mediaFallbackTimer);
@@ -1204,16 +1219,71 @@
         }
         state.heartbeatTimer = window.setInterval(sendHeartbeat, Math.max(100, state.heartbeatIntervalMs));
         state.clockTimer = window.setInterval(sendClockPing, 5000);
+        state.statusTimer = window.setInterval(
+            pollRoomState,
+            Math.max(500, state.heartbeatIntervalMs * 2)
+        );
         runInitialClockSync();
         sendHeartbeat();
+        pollRoomState();
     }
 
     function stopRealtime() {
         window.clearInterval(state.heartbeatTimer);
         window.clearInterval(state.clockTimer);
+        window.clearInterval(state.statusTimer);
         state.heartbeatTimer = null;
         state.clockTimer = null;
+        state.statusTimer = null;
+        state.statusPollInFlight = false;
+        state.statusPollFailures = 0;
         state.clockRequests.clear();
+    }
+
+    async function pollRoomState() {
+        const token = state.memberToken;
+        if (!token || state.statusPollInFlight) {
+            return;
+        }
+
+        state.statusPollInFlight = true;
+        const startedMono = performance.now();
+        const startedUnix = Date.now();
+        try {
+            const result = await apiRequest(getStatusPath(), "GET");
+            if (token !== state.memberToken) {
+                return;
+            }
+
+            const room = getValue(result, "Room", "room");
+            if (!room) {
+                state.statusPollFailures += 1;
+                if (state.statusPollFailures >= 3) {
+                    clearRoomState();
+                }
+                return;
+            }
+
+            state.statusPollFailures = 0;
+            state.connectionOnline = true;
+            const receivedUnix = Date.now();
+            const rtt = Math.max(0, Math.round(performance.now() - startedMono));
+            const serverReference = Number(getValue(room, "ReferenceUnixMs", "referenceUnixMs") || 0);
+            if (serverReference > 0) {
+                recordClockSample(rtt, serverReference - ((startedUnix + receivedUnix) / 2));
+            }
+            applyRoomState(room, "http");
+        } catch (error) {
+            if (token !== state.memberToken) {
+                return;
+            }
+            state.statusPollFailures += 1;
+            state.connectionOnline = false;
+            console.warn("[SyncPlay] HTTP room-state poll failed", error);
+            renderAll();
+        } finally {
+            state.statusPollInFlight = false;
+        }
     }
 
     function runInitialClockSync() {
@@ -1240,17 +1310,18 @@
         if (!state.memberToken || !video || isLocalSeekTransaction()) {
             return;
         }
-        if (isLoadingNewMedia() && bufferedAhead(video) >= state.readyBufferSeconds) {
+        const mediaReady = isVideoReady(video);
+        if (isLoadingNewMedia() && mediaReady) {
             return sendMediaReady(video);
         }
         return sendSocket("SyncPlayHeartbeat", {
             ClientSequence: ++state.clientSequence,
             MediaEpoch: state.mediaEpoch,
-            ItemId: getCurrentItemId(),
+            ItemId: getEventItemId(),
             PositionTicks: Math.round(video.currentTime * TICKS_PER_SECOND),
             IsPaused: video.paused,
-            IsBuffering: video.readyState < 3,
-            IsReady: bufferedAhead(video) >= state.readyBufferSeconds,
+            IsBuffering: !mediaReady,
+            IsReady: mediaReady,
             IsActive: state.activeParticipant,
             RoundTripTimeMs: getBestRtt(),
             ClientUnixMs: Date.now(),
@@ -1260,25 +1331,48 @@
 
     function sendControl(kind, force) {
         const video = state.video;
-        if (!state.memberToken || !video || isLoadingNewMedia() || (!force && performance.now() < state.suppressUntil)) {
+        const mediaLoadBlocked = isLoadingNewMedia() && !canControlDuringMediaLoad(video);
+        if (!state.memberToken || !video || mediaLoadBlocked || (!force && performance.now() < state.suppressUntil)) {
             return Promise.resolve(false);
         }
-        return sendSocket("SyncPlayControl", {
+        state.localControlUntil = Math.max(state.localControlUntil, performance.now() + 3500);
+        const payload = {
             EventId: createEventId(),
             ClientSequence: ++state.clientSequence,
             MediaEpoch: state.mediaEpoch,
-            ItemId: getCurrentItemId(),
+            ItemId: getEventItemId(),
             Kind: kind,
             PositionTicks: Math.round(video.currentTime * TICKS_PER_SECOND),
             IsPaused: video.paused,
             ClientUnixMs: Math.round(serverNow()),
             ClientMonotonicMs: Math.round(performance.now())
+        };
+        return sendControlEvent(payload).then(function (accepted) {
+            state.localControlUntil = Math.max(state.localControlUntil, performance.now() + 500);
+            return accepted;
+        });
+    }
+
+    function sendControlEvent(payload) {
+        return sendSocket("SyncPlayControl", payload).then(function (accepted) {
+            if (accepted) {
+                return true;
+            }
+            // A reverse proxy can drop a response even after Emby processed the
+            // request. Reusing the same sequence and EventId is idempotent: a
+            // duplicate is rejected without changing the room, while its
+            // response still carries the authoritative room snapshot.
+            return new Promise(function (resolve) {
+                window.setTimeout(function () {
+                    sendSocket("SyncPlayControl", payload).then(resolve);
+                }, 150);
+            });
         });
     }
 
     function sendBuffering(isBuffering) {
         const video = state.video;
-        if (!state.memberToken || !video || isLocalSeekTransaction() || performance.now() < state.suppressUntil) {
+        if (!state.memberToken || !video || isLocalSeekTransaction() || isLocalControlTransaction() || performance.now() < state.suppressUntil) {
             return Promise.resolve(false);
         }
         if (isLoadingNewMedia()) {
@@ -1287,11 +1381,11 @@
         return sendSocket("SyncPlayBuffering", {
             ClientSequence: ++state.clientSequence,
             MediaEpoch: state.mediaEpoch,
-            ItemId: getCurrentItemId(),
+            ItemId: getEventItemId(),
             PositionTicks: Math.round(video.currentTime * TICKS_PER_SECOND),
             IsPaused: video.paused,
             IsBuffering: isBuffering,
-            IsReady: !isBuffering && bufferedAhead(video) >= state.readyBufferSeconds,
+            IsReady: !isBuffering && isVideoReady(video),
             IsActive: state.activeParticipant,
             RoundTripTimeMs: getBestRtt(),
             ClientUnixMs: Date.now()
@@ -1299,10 +1393,10 @@
     }
 
     function sendMediaReady(video) {
-        if (!state.memberToken || !video || !isLoadingNewMedia()) {
+        if (!state.memberToken || !video || !isAwaitingMediaReady()) {
             return Promise.resolve(false);
         }
-        if (bufferedAhead(video) < state.readyBufferSeconds) {
+        if (!isVideoReady(video)) {
             return Promise.resolve(false);
         }
         const now = performance.now();
@@ -1311,14 +1405,22 @@
         }
         state.mediaReadyEpoch = state.mediaEpoch;
         state.mediaReadySentAt = now;
+        const transition = getValue(state.room, "MediaTransitionState", "mediaTransitionState") || "None";
+        // The room transition is authoritative. An initial join can retain a
+        // stale per-member loading flag even after the media is buffered; in
+        // that case a Ready event must be allowed to activate the member.
+        const isActive = transition === "None";
+        if (isActive) {
+            state.activeParticipant = true;
+        }
         return sendSocket("SyncPlayMediaReady", {
             ClientSequence: ++state.clientSequence,
             MediaEpoch: state.mediaEpoch,
-            ItemId: getCurrentItemId(),
+            ItemId: getEventItemId(),
             PositionTicks: Math.round(video.currentTime * TICKS_PER_SECOND),
             IsPaused: video.paused,
             IsReady: true,
-            IsActive: false,
+            IsActive: isActive,
             RoundTripTimeMs: getBestRtt(),
             ClientUnixMs: Date.now()
         });
@@ -1326,7 +1428,59 @@
 
     function isLoadingNewMedia() {
         return state.mediaSwitchLoading ||
-            (getValue(state.room, "MediaTransitionState", "mediaTransitionState") || "None") === "LoadingMembers";
+            (getValue(state.room, "MediaTransitionState", "mediaTransitionState") || "None") === "LoadingMembers" ||
+            getValue(state.room, "IsCurrentMemberMediaLoading", "isCurrentMemberMediaLoading") === true;
+    }
+
+    function isAwaitingMediaReady() {
+        const currentReady = getValue(state.room, "IsCurrentMemberMediaReady", "isCurrentMemberMediaReady");
+        if (currentReady === true) {
+            return false;
+        }
+        if (isLoadingNewMedia()) {
+            return true;
+        }
+        const pending = state.pendingCommand || state.lastLoadCommand;
+        return Boolean(pending &&
+            getValue(pending, "Kind", "kind") === "Load" &&
+            performance.now() < state.loadCommandExpiresAt);
+    }
+
+    function canControlDuringMediaLoad(video) {
+        if (!video || video.readyState < 2) {
+            return false;
+        }
+        const expectedItemId = Number(getValue(state.room, "ItemId", "itemId") || state.expectedItemId || 0);
+        const currentItemId = getCurrentItemId();
+        // Emby's playback manager can keep exposing the previous item after
+        // the new video element already has current data. The room item is the
+        // authoritative event stamp, so a stale NowPlayingItem must not block
+        // local pause, play, or seek controls.
+        return expectedItemId > 0 || currentItemId > 0;
+    }
+
+    function isVideoReady(video) {
+        if (!video) {
+            return false;
+        }
+        // Some Emby playback paths expose no useful TimeRanges even though the
+        // media element has future data and is already playing. readyState is
+        // therefore a valid readiness signal alongside the configured buffer.
+        return video.readyState >= 3 || bufferedAhead(video) >= state.readyBufferSeconds;
+    }
+
+    function getEventItemId() {
+        const expectedItemId = Number(
+            state.expectedItemId || getValue(state.room, "ItemId", "itemId") || 0
+        );
+        const currentItemId = getCurrentItemId();
+        // Emby may expose the previous NowPlayingItem for a short interval
+        // while the new source is already active. Prefer the room's expected
+        // item in that window so the server can match the media epoch.
+        if (expectedItemId > 0 && (!currentItemId || currentItemId !== expectedItemId)) {
+            return expectedItemId;
+        }
+        return currentItemId || expectedItemId;
     }
 
     function sendSocket(messageType, payload) {
@@ -1335,21 +1489,61 @@
             renderAll();
             return Promise.resolve(false);
         }
-        payload.MemberToken = state.memberToken;
-        payload.RoomCode = state.room && getValue(state.room, "Code", "code");
-        return apiRequest("SyncPlay/Events", "POST", { MessageType: messageType, Data: payload })
-            .then(function () {
+        const eventPayload = Object.assign({}, payload, {
+            MemberToken: state.memberToken,
+            RoomCode: state.room && getValue(state.room, "Code", "code"),
+            ClientInstanceId: getClientInstanceId()
+        });
+        const started = performance.now();
+        const startedUnix = Date.now();
+        return apiRequest("SyncPlay/Events", "POST", { MessageType: messageType, Data: eventPayload })
+            .then(function (result) {
+                const serverReceive = Number(getValue(result, "ServerReceiveUnixMs", "serverReceiveUnixMs") || 0);
+                const serverSend = Number(getValue(result, "ServerSendUnixMs", "serverSendUnixMs") || 0);
+                if (serverReceive > 0 && serverSend > 0) {
+                    const receivedUnix = Date.now();
+                    recordClockSample(
+                        Math.max(0, Math.round(performance.now() - started)),
+                        ((serverReceive + serverSend) / 2) - ((startedUnix + receivedUnix) / 2)
+                    );
+                }
+                const room = getValue(result, "Room", "room");
+                if (room) {
+                    applyRoomState(room, "http-event");
+                }
                 if (!state.connectionOnline) {
                     state.connectionOnline = true;
                     renderAll();
                 }
-                return true;
+                const accepted = getValue(result, "Accepted", "accepted");
+                if (accepted === false) {
+                    console.warn("[SyncPlay] Server rejected HTTP event", messageType);
+                    pollRoomState();
+                }
+                return accepted !== false;
             })
-            .catch(function () {
+            .catch(function (error) {
                 state.connectionOnline = false;
+                console.warn("[SyncPlay] HTTP event failed", messageType, {
+                    elapsedMs: Math.round(performance.now() - started),
+                    error: error
+                });
                 renderAll();
                 return false;
             });
+    }
+
+    function getClientInstanceId() {
+        if (!state.clientInstanceId) {
+            state.clientInstanceId = createEventId();
+        }
+        return state.clientInstanceId;
+    }
+
+    function getStatusPath() {
+        // Avoid a stale snapshot from a reverse proxy or NAS cache while the
+        // HTTP transport is acting as the room's realtime channel.
+        return "SyncPlay/Status?syncplayClientTime=" + encodeURIComponent(Date.now());
     }
 
     function isLocalSeekTransaction() {
@@ -1358,6 +1552,10 @@
             state.localSeekInProgress = false;
         }
         return state.localSeekInProgress || now < state.seekCommitUntil;
+    }
+
+    function isLocalControlTransaction() {
+        return performance.now() < state.localControlUntil;
     }
 
     function onServerMessage(event, message) {
@@ -1392,9 +1590,26 @@
         }
     }
 
-    function applyRoomState(room) {
+    function applyRoomState(room, source) {
+        if (!room) {
+            return;
+        }
+        const previousRoom = state.room;
+        const previousEpoch = Number(getValue(previousRoom, "MediaEpoch", "mediaEpoch") || state.mediaEpoch);
+        const previousItemId = Number(getValue(previousRoom, "ItemId", "itemId") || state.expectedItemId);
+        const previousRevision = Number(getValue(previousRoom, "Revision", "revision") || 0);
         const incomingEpoch = Number(getValue(room, "MediaEpoch", "mediaEpoch") || 0);
         if (incomingEpoch < state.mediaEpoch) {
+            return;
+        }
+        const incomingRevision = Number(getValue(room, "Revision", "revision") || 0);
+        if (incomingEpoch === previousEpoch && previousRevision && incomingRevision && incomingRevision < previousRevision) {
+            return;
+        }
+        const incomingReference = Number(getValue(room, "ReferenceUnixMs", "referenceUnixMs") || 0);
+        const previousReference = Number(getValue(previousRoom, "ReferenceUnixMs", "referenceUnixMs") || 0);
+        if (incomingEpoch === previousEpoch && incomingRevision === previousRevision &&
+            incomingReference && previousReference && incomingReference < previousReference) {
             return;
         }
         if (incomingEpoch > state.mediaEpoch) {
@@ -1414,8 +1629,88 @@
         } else if (transition === "None") {
             state.mediaSwitchLoading = false;
         }
+        const currentMemberLoading = getValue(room, "IsCurrentMemberMediaLoading", "isCurrentMemberMediaLoading");
+        const currentMemberReady = getValue(room, "IsCurrentMemberMediaReady", "isCurrentMemberMediaReady");
+        const currentMemberActive = getValue(room, "IsCurrentMemberActive", "isCurrentMemberActive");
+        if (currentMemberLoading === true && currentMemberReady !== true) {
+            state.activeParticipant = false;
+        } else if (currentMemberReady === true && transition === "None") {
+            state.activeParticipant = currentMemberActive !== false;
+        }
+        const mediaChanged = Boolean(previousRoom) &&
+            (incomingEpoch > previousEpoch || state.expectedItemId !== previousItemId);
+        if (mediaChanged && state.memberToken) {
+            // If the Emby WebSocket is unavailable, reconstruct the Load
+            // command from the authoritative room state and use the normal
+            // source-settling path.
+            applyCommand(buildRoomCommand(room, "Load"));
+        }
+        reconcileRoomPlayback(room, previousRoom, source);
         updateTransitionTicker();
         renderAll(false);
+    }
+
+    function buildRoomCommand(room, kind) {
+        const referenceUnixMs = Number(getValue(room, "ReferenceUnixMs", "referenceUnixMs") || serverNow());
+        return {
+            EventId: "http-room-state-" + String(getValue(room, "Revision", "revision") || 0),
+            Kind: kind,
+            RoomRevision: Number(getValue(room, "Revision", "revision") || 0),
+            MediaEpoch: Number(getValue(room, "MediaEpoch", "mediaEpoch") || state.mediaEpoch),
+            ItemId: Number(getValue(room, "ItemId", "itemId") || state.expectedItemId),
+            PositionTicks: Math.max(0, Math.round(Number(getValue(room, "PositionTicks", "positionTicks") || 0))),
+            ReferenceUnixMs: referenceUnixMs,
+            ExecuteAtUnixMs: serverNow(),
+            State: getValue(room, "State", "state") || "Paused",
+            Reason: getValue(room, "HoldReason", "holdReason") || "HttpRoomState"
+        };
+    }
+
+    function reconcileRoomPlayback(room, previousRoom, source) {
+        const video = state.video;
+        if (!video || !state.memberToken || isLocalSeekTransaction() || isLocalControlTransaction()) {
+            return;
+        }
+
+        const transition = getValue(room, "MediaTransitionState", "mediaTransitionState") || "None";
+        if (transition !== "None" && video.readyState < 2) {
+            return;
+        }
+
+        const roomState = getValue(room, "State", "state") || "Paused";
+        const targetSeconds = getRoomTargetTicks(room) / TICKS_PER_SECOND;
+        const driftMs = (targetSeconds - video.currentTime) * 1000;
+        const previousRevision = Number(getValue(previousRoom, "Revision", "revision") || 0);
+        const currentRevision = Number(getValue(room, "Revision", "revision") || 0);
+        const revisionChanged = currentRevision > previousRevision;
+
+        if (roomState === "Holding") {
+            if (!video.paused || Math.abs(driftMs) > 250) {
+                executeCommand(video, buildRoomCommand(room, "Hold"));
+            }
+            return;
+        }
+
+        if (roomState === "Paused") {
+            if (!video.paused || Math.abs(driftMs) > 250) {
+                executeCommand(video, buildRoomCommand(room, "Pause"));
+            }
+            state.activeParticipant = true;
+            return;
+        }
+
+        if (roomState !== "Playing" || video.readyState < 2) {
+            return;
+        }
+
+        state.activeParticipant = true;
+        if (video.paused) {
+            executeCommand(video, buildRoomCommand(room, "Play"));
+        } else if (Math.abs(driftMs) >= state.hardDriftMs || (revisionChanged && Math.abs(driftMs) > 250)) {
+            executeCommand(video, buildRoomCommand(room, "Correct"));
+        } else if (Math.abs(driftMs) >= state.softDriftMs && !video.seeking && video.readyState >= 3) {
+            nudgeVideo(video, targetSeconds);
+        }
     }
 
     function normalizeData(data) {
@@ -1439,9 +1734,17 @@
         const receivedUnix = Date.now();
         const rtt = Math.max(0, Math.round(performance.now() - request.mono));
         const serverMid = (Number(getValue(pong, "ServerReceiveUnixMs", "serverReceiveUnixMs")) + Number(getValue(pong, "ServerSendUnixMs", "serverSendUnixMs"))) / 2;
-        const clientMid = (request.unix + receivedUnix) / 2;
-        state.clockSamples.push({ rtt: rtt, offset: serverMid - clientMid });
-        state.clockSamples = state.clockSamples.sort(function (a, b) { return a.rtt - b.rtt; }).slice(0, 8);
+        recordClockSample(rtt, serverMid - ((request.unix + receivedUnix) / 2));
+    }
+
+    function recordClockSample(rtt, offset) {
+        if (!Number.isFinite(rtt) || !Number.isFinite(offset)) {
+            return;
+        }
+        state.clockSamples.push({ rtt: Math.max(0, rtt), offset: offset });
+        state.clockSamples = state.clockSamples
+            .sort(function (a, b) { return a.rtt - b.rtt; })
+            .slice(0, 8);
         if (state.clockSamples.length) {
             state.clockOffsetMs = state.clockSamples[0].offset;
         }
@@ -1450,7 +1753,7 @@
     function applyCommand(command) {
         const kind = getValue(command, "Kind", "kind");
         const commandEpoch = Number(getValue(command, "MediaEpoch", "mediaEpoch") || 0);
-        if (commandEpoch && commandEpoch < state.mediaEpoch) {
+        if (isCommandObsolete(command)) {
             return;
         }
         if (commandEpoch > state.mediaEpoch) {
@@ -1460,11 +1763,6 @@
         if (getValue(command, "Reason", "reason") === "MediaSwitch") {
             state.mediaSwitchLoading = true;
             state.expectedItemId = Number(getValue(command, "ItemId", "itemId") || state.expectedItemId);
-        }
-        const commandRevision = Number(getValue(command, "RoomRevision", "roomRevision") || 0);
-        const roomRevision = Number(getValue(state.room, "Revision", "revision") || 0);
-        if (commandRevision && roomRevision && commandRevision < roomRevision) {
-            return;
         }
         if (isLocalSeekTransaction() && (kind === "Correct" || kind === "Nudge" || kind === "Hold" || kind === "Resume")) {
             return;
@@ -1495,6 +1793,9 @@
         const executeAt = Number(getValue(command, "ExecuteAtUnixMs", "executeAtUnixMs") || 0);
         const delay = Math.max(0, executeAt - serverNow());
         window.setTimeout(function () {
+            if (isCommandObsolete(command)) {
+                return;
+            }
             if (video !== state.video) {
                 state.pendingCommand = command;
                 return;
@@ -1503,11 +1804,26 @@
         }, delay);
     }
 
+    function isCommandObsolete(command) {
+        const commandEpoch = Number(getValue(command, "MediaEpoch", "mediaEpoch") || 0);
+        if (commandEpoch && commandEpoch < state.mediaEpoch) {
+            return true;
+        }
+        const commandRevision = Number(getValue(command, "RoomRevision", "roomRevision") || 0);
+        const roomRevision = Number(getValue(state.room, "Revision", "revision") || 0);
+        return Boolean(commandRevision && roomRevision && commandRevision < roomRevision);
+    }
+
     function executeCommand(video, command) {
         const kind = getValue(command, "Kind", "kind");
         const targetSeconds = getCommandTargetSeconds(command);
         const roomState = getValue(command, "State", "state");
 
+        const preservesMediaSwitchLoad = kind === "Hold" &&
+            getValue(command, "Reason", "reason") === "MediaSwitch";
+        if (kind !== "Load" && !preservesMediaSwitchLoad) {
+            cancelLoadAlignment();
+        }
         if (kind !== "Nudge") {
             state.suppressUntil = performance.now() + 800;
         }
@@ -1546,6 +1862,15 @@
         state.lastLoadCommand = command;
         state.loadCommandExpiresAt = performance.now() + 12000;
         return true;
+    }
+
+    function cancelLoadAlignment() {
+        state.loadAlignmentGeneration += 1;
+        state.pendingCommand = null;
+        state.lastLoadCommand = null;
+        state.loadCommandExpiresAt = 0;
+        window.clearTimeout(state.mediaFallbackTimer);
+        state.mediaFallbackTimer = null;
     }
 
     function isNewerLoadCommand(incoming, current) {
@@ -1813,8 +2138,8 @@
             pause: function () { if (!video.ended) { sendControl("Pause"); } },
             seeking: function () { beginLocalSeek(video); },
             seeked: function () { finishLocalSeek(video); },
-            waiting: function () { if (!video.seeking && !isLocalSeekTransaction()) { sendBuffering(true); } },
-            stalled: function () { if (!video.seeking && !isLocalSeekTransaction()) { sendBuffering(true); } },
+            waiting: function () { if (!video.seeking && !isLocalSeekTransaction() && !isLocalControlTransaction()) { sendBuffering(true); } },
+            stalled: function () { if (!video.seeking && !isLocalSeekTransaction() && !isLocalControlTransaction()) { sendBuffering(true); } },
             loadedmetadata: markReadyAfterInitialLoad,
             canplay: markReadyAfterInitialLoad,
             playing: markReadyAfterInitialLoad,
@@ -1836,11 +2161,16 @@
 
         function markReadyAfterInitialLoad() {
             applyPendingLoadToVideo(video);
-            if (bufferedAhead(video) < state.readyBufferSeconds) {
+            if (!isVideoReady(video)) {
                 return;
             }
-            if (isLoadingNewMedia()) {
-                sendMediaReady(video);
+            if (isAwaitingMediaReady()) {
+                sendMediaReady(video).then(function () {
+                    if (!isAwaitingMediaReady() && getValue(state.room, "MediaTransitionState", "mediaTransitionState") === "None") {
+                        state.activeParticipant = true;
+                        sendHeartbeat();
+                    }
+                });
                 return;
             }
             if (!state.activeParticipant) {
@@ -1992,6 +2322,10 @@
             dataType: "json",
             headers: { Accept: "application/json" }
         };
+        if (method === "GET") {
+            options.headers["Cache-Control"] = "no-cache, no-store";
+            options.headers.Pragma = "no-cache";
+        }
         if (body !== undefined && method !== "GET") {
             options.data = JSON.stringify(body);
             options.contentType = "application/json";

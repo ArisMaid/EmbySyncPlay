@@ -26,9 +26,10 @@ namespace Emby.SyncPlay.Runtime
             object data,
             CancellationToken cancellationToken)
         {
+            var command = data as SyncPlayCommand;
+            var fallbackRequired = false;
             try
             {
-                var command = data as SyncPlayCommand;
                 var session = _sessionManager.Sessions.FirstOrDefault(item =>
                     item != null && string.Equals(item.Id, sessionId, StringComparison.OrdinalIgnoreCase));
                 var controllers = session?.SessionControllers?
@@ -38,6 +39,7 @@ namespace Emby.SyncPlay.Runtime
 
                 if (controllers == null || controllers.Length == 0)
                 {
+                    fallbackRequired = true;
                     if (command != null && string.Equals(command.Kind, "Load", StringComparison.OrdinalIgnoreCase))
                     {
                         await _sessionManager.SendPlayCommand(
@@ -52,18 +54,44 @@ namespace Emby.SyncPlay.Runtime
                                 cancellationToken)
                             .ConfigureAwait(false);
                     }
-                    await SendFallbackAsync(sessionId, command, cancellationToken).ConfigureAwait(false);
-                    return;
                 }
-
-                var messageId = command?.EventId ?? Guid.NewGuid().ToString("N");
-                await Task.WhenAll(controllers.Select(controller =>
-                        controller.SendMessage(messageName, messageId, data, cancellationToken)))
-                    .ConfigureAwait(false);
+                else
+                {
+                    var messageId = command?.EventId ?? Guid.NewGuid().ToString("N");
+                    var sendTask = Task.WhenAll(controllers.Select(controller =>
+                        controller.SendMessage(messageName, messageId, data, cancellationToken)));
+                    var completed = await Task.WhenAny(
+                            sendTask,
+                            Task.Delay(TimeSpan.FromSeconds(2), cancellationToken))
+                        .ConfigureAwait(false);
+                    if (completed != sendTask)
+                    {
+                        fallbackRequired = true;
+                        _logger.Info("[SyncPlay] Timed out sending " + messageName +
+                            " to session " + sessionId + "; using media-control fallback.");
+                    }
+                    else
+                    {
+                        await sendTask.ConfigureAwait(false);
+                    }
+                }
             }
             catch (Exception exception)
             {
                 _logger.ErrorException("[SyncPlay] Failed to send " + messageName + " to session " + sessionId, exception);
+                fallbackRequired = true;
+            }
+
+            if (fallbackRequired)
+            {
+                try
+                {
+                    await SendFallbackAsync(sessionId, command, cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception exception)
+                {
+                    _logger.ErrorException("[SyncPlay] Media-control fallback failed for session " + sessionId, exception);
+                }
             }
         }
 

@@ -32,6 +32,7 @@ namespace Emby.SyncPlay.Core
         public string UserName { get; set; }
         public string DeviceName { get; set; }
         public string Token { get; set; }
+        public string ClientInstanceId { get; set; }
         public long LastClientSequence { get; set; }
         public long LastHeartbeatUnixMs { get; set; }
         public long PositionTicks { get; set; }
@@ -123,6 +124,9 @@ namespace Emby.SyncPlay.Core
         public string HoldReason { get; set; }
         public int ReadyMemberCount { get; set; }
         public int LoadingMemberCount { get; set; }
+        public bool IsCurrentMemberMediaLoading { get; set; }
+        public bool IsCurrentMemberMediaReady { get; set; }
+        public bool IsCurrentMemberActive { get; set; }
         public bool IsCreator { get; set; }
         public int MemberCount { get; set; }
         public List<RoomMemberDto> Members { get; set; }
@@ -142,6 +146,7 @@ namespace Emby.SyncPlay.Core
     {
         public string MemberToken { get; set; }
         public string RoomCode { get; set; }
+        public string ClientInstanceId { get; set; }
         public long ClientSequence { get; set; }
         public string EventId { get; set; }
         public string Kind { get; set; }
@@ -180,6 +185,14 @@ namespace Emby.SyncPlay.Core
         public long ClientUnixMs { get; set; }
         public long ServerReceiveUnixMs { get; set; }
         public long ServerSendUnixMs { get; set; }
+    }
+
+    public sealed class SyncPlayEventResult
+    {
+        public bool Accepted { get; set; }
+        public long ServerReceiveUnixMs { get; set; }
+        public long ServerSendUnixMs { get; set; }
+        public RoomDto Room { get; set; }
     }
 
     public sealed class SessionDescriptor

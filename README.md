@@ -9,12 +9,13 @@
 - 任一活跃成员缓冲时暂停全房，Ready 后统一恢复
 - 仅房主可切换全房媒体；普通成员切换时只退出自己
 - 房主选片期间保留房间，新媒体加载完成后统一开播
+- WebSocket 不可用时通过 `/SyncPlay/Events` + `/SyncPlay/Status` 的 HTTP 通道继续同步
 
 ## 安装
 
 从 [Releases](../../releases) 下载：
 
-- `EmbySyncPlay-1.5.5-amilys.zip`：推荐安装包，包含 DLL、Web 加载器和安装说明。
+- `EmbySyncPlay-1.5.6-amilys.zip`：推荐安装包，包含 DLL、Web 加载器和安装说明。
 - `Emby.SyncPlay.dll`：仅服务端组件，适用于已单独配置 Web 加载器的环境。
 
 Docker 用户也可直接构建：
@@ -24,6 +25,8 @@ docker compose up -d --build
 ```
 
 媒体目录默认为 `./media` 和 `./strm`，可通过 `EMBY_MEDIA_PATH`、`EMBY_STRM_PATH` 修改。
+
+如果 Emby 前置反向代理不支持 WebSocket Upgrade，插件会自动使用 HTTP fallback；仍建议透传 `/embywebsocket` 的 `Connection: Upgrade` 与 `Upgrade: websocket`，或在局域网直接访问 Emby 的 `8096` 端口。
 
 ## 构建与测试
 
@@ -36,4 +39,4 @@ node --test tests/client-observer.test.js
 
 ## 当前版本
 
-`1.5.5`
+`1.5.6`

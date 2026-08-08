@@ -111,6 +111,102 @@ namespace Emby.SyncPlay.Tests
         }
 
         [Fact]
+        public async Task ReadyHeartbeat_ClearsInitialJoinLoadingFlag()
+        {
+            var fixture = new Fixture();
+            var created = fixture.CreateRoom();
+            var joined = await fixture.Manager.JoinRoomAsync(created.Room.Code, fixture.Guest, CancellationToken.None);
+
+            var before = fixture.Manager.GetStatus(fixture.Guest.SessionId).Room;
+            Assert.True(before.Members.Single(member => !member.IsCreator).IsMediaLoading);
+
+            await fixture.Manager.ProcessSocketMessageAsync("SyncPlayHeartbeat", new SyncPlaySocketEnvelope
+            {
+                MemberToken = joined.MemberToken,
+                MediaEpoch = before.MediaEpoch,
+                ItemId = before.ItemId,
+                IsReady = true,
+                IsActive = false,
+                IsBuffering = false,
+                PositionTicks = before.PositionTicks
+            }, CancellationToken.None);
+
+            var after = fixture.Manager.GetStatus(fixture.Guest.SessionId).Room;
+            var member = after.Members.Single(item => !item.IsCreator);
+            Assert.False(member.IsMediaLoading);
+            Assert.True(member.IsMediaReady);
+            Assert.True(member.IsActive);
+            Assert.Equal(0, after.LoadingMemberCount);
+        }
+
+        [Fact]
+        public async Task Control_ClearsInitialJoinLoadingFlagWhenReadyHeartbeatWasLost()
+        {
+            var fixture = new Fixture();
+            var created = fixture.CreateRoom();
+            var joined = await fixture.Manager.JoinRoomAsync(created.Room.Code, fixture.Guest, CancellationToken.None);
+
+            var accepted = await fixture.Manager.ProcessSocketMessageAsync("SyncPlayControl", new SyncPlaySocketEnvelope
+            {
+                MemberToken = joined.MemberToken,
+                ClientInstanceId = "page-control",
+                ClientSequence = 1,
+                EventId = "pause-after-load",
+                MediaEpoch = 1,
+                ItemId = 42,
+                Kind = "Pause",
+                IsPaused = true,
+                PositionTicks = TimeSpan.FromSeconds(3).Ticks
+            }, CancellationToken.None);
+
+            Assert.True(accepted);
+            var status = fixture.Manager.GetStatus(fixture.Guest.SessionId).Room;
+            var member = status.Members.Single(item => !item.IsCreator);
+            Assert.False(member.IsMediaLoading);
+            Assert.True(member.IsMediaReady);
+            Assert.True(member.IsActive);
+            Assert.Equal(0, status.LoadingMemberCount);
+        }
+
+        [Fact]
+        public async Task ClientInstanceChange_AllowsSequenceToRestartAfterReload()
+        {
+            var fixture = new Fixture();
+            var created = fixture.CreateRoom();
+            var joined = await fixture.Manager.JoinRoomAsync(created.Room.Code, fixture.Guest, CancellationToken.None);
+
+            await fixture.Manager.ProcessSocketMessageAsync("SyncPlayControl", new SyncPlaySocketEnvelope
+            {
+                MemberToken = joined.MemberToken,
+                ClientInstanceId = "page-a",
+                ClientSequence = 25,
+                EventId = "page-a-pause",
+                Kind = "Pause",
+                ItemId = 42,
+                MediaEpoch = 1,
+                IsPaused = true,
+                PositionTicks = TimeSpan.FromSeconds(4).Ticks
+            }, CancellationToken.None);
+
+            await fixture.Manager.ProcessSocketMessageAsync("SyncPlayControl", new SyncPlaySocketEnvelope
+            {
+                MemberToken = joined.MemberToken,
+                ClientInstanceId = "page-b",
+                ClientSequence = 1,
+                EventId = "page-b-play",
+                Kind = "Play",
+                ItemId = 42,
+                MediaEpoch = 1,
+                IsPaused = false,
+                PositionTicks = TimeSpan.FromSeconds(5).Ticks
+            }, CancellationToken.None);
+
+            Assert.Equal("Playing", fixture.Manager.GetStatus(fixture.Host.SessionId).Room.State);
+            Assert.Contains(fixture.Sink.Commands.Select(item => item.Data).OfType<SyncPlayCommand>(), command =>
+                command.EventId == "page-b-play" && command.Kind == "Play");
+        }
+
+        [Fact]
         public async Task Control_RejectsOutOfOrderSequenceAndBroadcastsLatest()
         {
             var fixture = new Fixture();
@@ -419,6 +515,40 @@ namespace Emby.SyncPlay.Tests
                 .Where(command => command.Kind == "Resume").ToList();
             Assert.Equal(2, resumes.Count);
             Assert.Single(resumes.Select(command => command.ExecuteAtUnixMs).Distinct());
+        }
+
+        [Fact]
+        public async Task ReadyHeartbeat_ReleasesMediaBarrierWhenWebSocketReadyMessageIsLost()
+        {
+            var fixture = new Fixture();
+            var created = fixture.CreateRoom();
+            var joined = await fixture.Manager.JoinRoomAsync(created.Room.Code, fixture.Guest, CancellationToken.None);
+            fixture.Manager.HandlePlaybackStopped(fixture.Host.SessionId, 42, "host-old", false);
+            var started = await fixture.Manager.HandlePlaybackStartedAsync(
+                fixture.Host.SessionId, 84, "Episode 2", 0, false, "host-new", CancellationToken.None);
+            fixture.Sink.Commands.Clear();
+
+            await fixture.Manager.ProcessSocketMessageAsync("SyncPlayMediaReady", new SyncPlaySocketEnvelope
+            {
+                MemberToken = created.MemberToken,
+                MediaEpoch = started.MediaEpoch,
+                ItemId = 84
+            }, CancellationToken.None);
+            await fixture.Manager.ProcessSocketMessageAsync("SyncPlayHeartbeat", new SyncPlaySocketEnvelope
+            {
+                MemberToken = joined.MemberToken,
+                MediaEpoch = started.MediaEpoch,
+                ItemId = 84,
+                IsReady = true,
+                IsActive = true,
+                IsBuffering = false,
+                PositionTicks = 0
+            }, CancellationToken.None);
+
+            var status = fixture.Manager.GetStatus(fixture.Host.SessionId).Room;
+            Assert.Equal("None", status.MediaTransitionState);
+            Assert.Contains(fixture.Sink.Commands.Select(item => item.Data).OfType<SyncPlayCommand>(), command =>
+                command.Kind == "Resume");
         }
 
         [Fact]
