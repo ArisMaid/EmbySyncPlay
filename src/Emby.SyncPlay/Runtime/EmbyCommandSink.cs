@@ -29,21 +29,6 @@ namespace Emby.SyncPlay.Runtime
             try
             {
                 var command = data as SyncPlayCommand;
-                if (command != null && string.Equals(command.Kind, "Load", StringComparison.OrdinalIgnoreCase))
-                {
-                    await _sessionManager.SendPlayCommand(
-                            null,
-                            sessionId,
-                            new PlayRequest
-                            {
-                                ItemIds = new[] { command.ItemId },
-                                StartPositionTicks = command.PositionTicks,
-                                PlayCommand = PlayCommand.PlayNow
-                            },
-                            cancellationToken)
-                        .ConfigureAwait(false);
-                }
-
                 var session = _sessionManager.Sessions.FirstOrDefault(item =>
                     item != null && string.Equals(item.Id, sessionId, StringComparison.OrdinalIgnoreCase));
                 var controllers = session?.SessionControllers?
@@ -53,6 +38,20 @@ namespace Emby.SyncPlay.Runtime
 
                 if (controllers == null || controllers.Length == 0)
                 {
+                    if (command != null && string.Equals(command.Kind, "Load", StringComparison.OrdinalIgnoreCase))
+                    {
+                        await _sessionManager.SendPlayCommand(
+                                null,
+                                sessionId,
+                                new PlayRequest
+                                {
+                                    ItemIds = new[] { command.ItemId },
+                                    StartPositionTicks = command.PositionTicks,
+                                    PlayCommand = PlayCommand.PlayNow
+                                },
+                                cancellationToken)
+                            .ConfigureAwait(false);
+                    }
                     await SendFallbackAsync(sessionId, command, cancellationToken).ConfigureAwait(false);
                     return;
                 }
@@ -105,4 +104,3 @@ namespace Emby.SyncPlay.Runtime
         }
     }
 }
-

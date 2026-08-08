@@ -149,6 +149,72 @@ namespace Emby.SyncPlay.Tests
         }
 
         [Fact]
+        public async Task PlayingSeek_AnchorsAtServerReceiveTimeUsingClientTransit()
+        {
+            var fixture = new Fixture();
+            var created = fixture.CreateRoom();
+            await fixture.Manager.JoinRoomAsync(created.Room.Code, fixture.Guest, CancellationToken.None);
+            fixture.Sink.Commands.Clear();
+
+            await fixture.Manager.ProcessSocketMessageAsync("SyncPlayHeartbeat", new SyncPlaySocketEnvelope
+            {
+                MemberToken = created.MemberToken,
+                ClientSequence = 1,
+                IsActive = true,
+                IsReady = true,
+                RoundTripTimeMs = 400,
+                PositionTicks = TimeSpan.FromSeconds(5).Ticks
+            }, CancellationToken.None);
+
+            fixture.Clock.Advance(TimeSpan.FromMilliseconds(120));
+            await fixture.Manager.ProcessSocketMessageAsync("SyncPlayControl", new SyncPlaySocketEnvelope
+            {
+                MemberToken = created.MemberToken,
+                ClientSequence = 2,
+                EventId = "seek-with-transit",
+                Kind = "Seek",
+                PositionTicks = TimeSpan.FromSeconds(10).Ticks,
+                IsPaused = false,
+                ClientUnixMs = fixture.Clock.UnixTimeMilliseconds - 120
+            }, CancellationToken.None);
+
+            var command = Assert.Single(fixture.Sink.Commands
+                .Where(item => item.SessionId != fixture.Host.SessionId)
+                .Select(item => item.Data)
+                .OfType<SyncPlayCommand>());
+            Assert.Equal("Seek", command.Kind);
+            Assert.Equal(TimeSpan.FromSeconds(10.2).Ticks, command.PositionTicks);
+        }
+
+        [Fact]
+        public async Task PausedSeek_DoesNotApplyPlayingTransitCompensation()
+        {
+            var fixture = new Fixture();
+            var created = fixture.CreateRoom();
+            await fixture.Manager.JoinRoomAsync(created.Room.Code, fixture.Guest, CancellationToken.None);
+            fixture.Sink.Commands.Clear();
+
+            await fixture.Manager.ProcessSocketMessageAsync("SyncPlayControl", new SyncPlaySocketEnvelope
+            {
+                MemberToken = created.MemberToken,
+                ClientSequence = 1,
+                EventId = "paused-seek",
+                Kind = "Seek",
+                PositionTicks = TimeSpan.FromSeconds(10).Ticks,
+                IsPaused = true,
+                ClientUnixMs = fixture.Clock.UnixTimeMilliseconds - 1000,
+                RoundTripTimeMs = 1000
+            }, CancellationToken.None);
+
+            var command = Assert.Single(fixture.Sink.Commands
+                .Where(item => item.SessionId != fixture.Host.SessionId)
+                .Select(item => item.Data)
+                .OfType<SyncPlayCommand>());
+            Assert.Equal(TimeSpan.FromSeconds(10).Ticks, command.PositionTicks);
+            Assert.Equal("Paused", fixture.Manager.GetStatus(fixture.Host.SessionId).Room.State);
+        }
+
+        [Fact]
         public async Task ActiveBuffering_HoldsEveryoneAndResumesWhenReady()
         {
             var fixture = new Fixture();

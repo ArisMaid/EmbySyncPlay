@@ -117,7 +117,7 @@
         const link = document.createElement("link");
         link.id = "syncPlay-client-css";
         link.rel = "stylesheet";
-        link.href = "/web/configurationpage?name=syncplayclientcss&v=1.5.4";
+        link.href = "/web/configurationpage?name=syncplayclientcss&v=1.5.5";
         document.head.appendChild(link);
     }
 
@@ -1013,19 +1013,36 @@
 
         const serverId = state.apiClient.serverId();
         const positionTicks = getRoomTargetTicks(room);
+        const roomPositionTicks = Math.max(0, Math.round(Number(getValue(room, "PositionTicks", "positionTicks") || 0)));
+        const roomReferenceUnixMs = Number(getValue(room, "ReferenceUnixMs", "referenceUnixMs") || serverNow());
         const roomState = getValue(room, "State", "state") || "Paused";
-        state.pendingCommand = {
+        const loadCommand = {
             Kind: "Load",
             ItemId: itemId,
             MediaEpoch: Number(getValue(room, "MediaEpoch", "mediaEpoch") || state.mediaEpoch),
-            PositionTicks: positionTicks,
-            ReferenceUnixMs: serverNow(),
+            RoomRevision: Number(getValue(room, "Revision", "revision") || 0),
+            PositionTicks: roomPositionTicks,
+            ReferenceUnixMs: roomReferenceUnixMs,
             State: roomState
         };
-        rememberLoadCommand(state.pendingCommand);
+        if (rememberLoadCommand(loadCommand)) {
+            state.pendingCommand = loadCommand;
+        } else if (!state.pendingCommand) {
+            state.pendingCommand = state.lastLoadCommand;
+        }
         closeHeaderMenu(false);
 
         try {
+            const currentItemId = getCurrentItemId();
+            if (state.video && currentItemId && currentItemId === itemId) {
+                // A server Load can arrive while the join request is still
+                // resolving. Replaying the same item would reset its source and
+                // reintroduce a seek offset.
+                const activeLoad = state.pendingCommand || state.lastLoadCommand || loadCommand;
+                state.pendingCommand = null;
+                executeCommand(state.video, activeLoad);
+                return;
+            }
             const item = await state.apiClient.getItem(state.apiClient.getCurrentUserId(), String(itemId));
             const playbackManager = await getPlaybackManager();
             if (!playbackManager || !playbackManager.play) {
@@ -1254,7 +1271,7 @@
             Kind: kind,
             PositionTicks: Math.round(video.currentTime * TICKS_PER_SECOND),
             IsPaused: video.paused,
-            ClientUnixMs: Date.now(),
+            ClientUnixMs: Math.round(serverNow()),
             ClientMonotonicMs: Math.round(performance.now())
         });
     }
@@ -1453,9 +1470,11 @@
             return;
         }
         if (kind === "Load") {
+            if (!rememberLoadCommand(command)) {
+                return;
+            }
             state.expectedItemId = Number(getValue(command, "ItemId", "itemId") || 0);
             state.activeParticipant = false;
-            rememberLoadCommand(command);
             state.pendingCommand = command;
             ensureExpectedMedia(command);
             const currentItemId = getCurrentItemId();
@@ -1476,6 +1495,10 @@
         const executeAt = Number(getValue(command, "ExecuteAtUnixMs", "executeAtUnixMs") || 0);
         const delay = Math.max(0, executeAt - serverNow());
         window.setTimeout(function () {
+            if (video !== state.video) {
+                state.pendingCommand = command;
+                return;
+            }
             executeCommand(video, command);
         }, delay);
     }
@@ -1517,8 +1540,39 @@
     }
 
     function rememberLoadCommand(command) {
+        if (!isNewerLoadCommand(command, state.lastLoadCommand)) {
+            return false;
+        }
         state.lastLoadCommand = command;
         state.loadCommandExpiresAt = performance.now() + 12000;
+        return true;
+    }
+
+    function isNewerLoadCommand(incoming, current) {
+        if (!current) {
+            return true;
+        }
+
+        const incomingEpoch = Number(getValue(incoming, "MediaEpoch", "mediaEpoch") || 0);
+        const currentEpoch = Number(getValue(current, "MediaEpoch", "mediaEpoch") || 0);
+        if (incomingEpoch !== currentEpoch) {
+            return incomingEpoch > currentEpoch;
+        }
+
+        const incomingRevision = Number(getValue(incoming, "RoomRevision", "roomRevision") || 0);
+        const currentRevision = Number(getValue(current, "RoomRevision", "roomRevision") || 0);
+        if (incomingRevision !== currentRevision) {
+            return incomingRevision > currentRevision;
+        }
+
+        const incomingReference = Number(getValue(incoming, "ReferenceUnixMs", "referenceUnixMs") || 0);
+        const currentReference = Number(getValue(current, "ReferenceUnixMs", "referenceUnixMs") || 0);
+        if (incomingReference !== currentReference) {
+            return incomingReference > currentReference;
+        }
+
+        return Number(getValue(incoming, "PositionTicks", "positionTicks") || 0) >
+            Number(getValue(current, "PositionTicks", "positionTicks") || 0);
     }
 
     function ensureExpectedMedia(command) {
@@ -1554,7 +1608,7 @@
         }
         await playbackManager.play({
             items: [item],
-            startPositionTicks: Number(getValue(command, "PositionTicks", "positionTicks") || 0),
+            startPositionTicks: getCommandTargetTicks(command),
             fullscreen: true,
             enableRemotePlayers: false
         });
@@ -1601,6 +1655,10 @@
             targetSeconds += Math.max(0, serverNow() - referenceMs) / 1000;
         }
         return targetSeconds;
+    }
+
+    function getCommandTargetTicks(command) {
+        return Math.max(0, Math.round(getCommandTargetSeconds(command) * TICKS_PER_SECOND));
     }
 
     function scheduleLoadAlignment(video, command) {

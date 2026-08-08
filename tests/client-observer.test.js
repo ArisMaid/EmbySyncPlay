@@ -626,6 +626,43 @@ test("Load alignment retries after Emby replaces the media source", () => {
     assert.deepEqual(aligned, [12, 12]);
 });
 
+test("Load commands keep the newest room anchor and ignore duplicate delivery", () => {
+    const clientPath = path.join(__dirname, "..", "src", "Emby.SyncPlay", "Web", "client.js");
+    const source = fs.readFileSync(clientPath, "utf8");
+    const functionSource = extractFunction(source, "rememberLoadCommand");
+    const isNewerSource = extractFunction(source, "isNewerLoadCommand");
+    const getValue = (object, pascalName, camelName) => object[pascalName] !== undefined
+        ? object[pascalName]
+        : object[camelName];
+    const isNewerLoadCommand = new Function("getValue", "return (" + isNewerSource + ");")(getValue);
+    const current = { MediaEpoch: 2, RoomRevision: 9, PositionTicks: 100000000, ReferenceUnixMs: 5000 };
+    assert.equal(isNewerLoadCommand({ MediaEpoch: 2, RoomRevision: 8, PositionTicks: 999999999, ReferenceUnixMs: 9000 }, current), false);
+    assert.equal(isNewerLoadCommand({ MediaEpoch: 2, RoomRevision: 9, PositionTicks: 100000000, ReferenceUnixMs: 5000 }, current), false);
+    assert.equal(isNewerLoadCommand({ MediaEpoch: 2, RoomRevision: 9, PositionTicks: 100000000, ReferenceUnixMs: 5100 }, current), true);
+    assert.equal(isNewerLoadCommand({ MediaEpoch: 3, RoomRevision: 1, PositionTicks: 0, ReferenceUnixMs: 1 }, current), true);
+
+    const state = { lastLoadCommand: null, loadCommandExpiresAt: 0 };
+    let now = 100;
+    const rememberLoadCommand = new Function(
+        "state",
+        "performance",
+        "isNewerLoadCommand",
+        "return (" + functionSource + ");"
+    )(
+        state,
+        { now: () => now },
+        isNewerLoadCommand
+    );
+    const first = { MediaEpoch: 2, RoomRevision: 9, PositionTicks: 100000000, ReferenceUnixMs: 5000 };
+    assert.equal(rememberLoadCommand(first), true);
+    assert.equal(rememberLoadCommand(first), false);
+    now = 250;
+    const newer = { MediaEpoch: 2, RoomRevision: 9, PositionTicks: 100000000, ReferenceUnixMs: 5100 };
+    assert.equal(rememberLoadCommand(newer), true);
+    assert.equal(state.lastLoadCommand, newer);
+    assert.equal(state.loadCommandExpiresAt, 12250);
+});
+
 test("sync surfaces animate without display-none teardown", () => {
     const clientPath = path.join(__dirname, "..", "src", "Emby.SyncPlay", "Web", "client.js");
     const cssPath = path.join(__dirname, "..", "src", "Emby.SyncPlay", "Web", "client.css");
