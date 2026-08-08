@@ -654,7 +654,11 @@ namespace Emby.SyncPlay.Core
                 }
 
                 var nowMs = _clock.UnixTimeMilliseconds;
-                room.PositionTicks = Math.Max(0, envelope.PositionTicks);
+                // The browser reports the position when the local control event
+                // is emitted, while this request is handled a little later. For
+                // controls that leave playback running, keep the room anchor at
+                // the position reached when the server accepts the request.
+                room.PositionTicks = EstimateControlPositionTicks(member, envelope, kind, nowMs);
                 room.ReferenceUnixMs = nowMs;
                 room.LastActivityAt = _clock.UtcNow;
                 room.Revision++;
@@ -674,6 +678,29 @@ namespace Emby.SyncPlay.Core
 
             await BroadcastCommandAsync(room, command, member.SessionId, cancellationToken).ConfigureAwait(false);
             await BroadcastStateAsync(room, cancellationToken).ConfigureAwait(false);
+        }
+
+        private static long EstimateControlPositionTicks(
+            SyncPlayMember member,
+            SyncPlaySocketEnvelope envelope,
+            SyncControlKind kind,
+            long nowMs)
+        {
+            var positionTicks = Math.Max(0, envelope.PositionTicks);
+            if (envelope.IsPaused || (kind != SyncControlKind.Play && kind != SyncControlKind.Seek))
+            {
+                return positionTicks;
+            }
+
+            long transitMs = Math.Max(0, member.RoundTripTimeMs / 2);
+            if (envelope.ClientUnixMs > 0 && envelope.ClientUnixMs <= nowMs)
+            {
+                // Do not let a stale clock sample create a multi-second jump.
+                var stampedTransitMs = Math.Min(2000, nowMs - envelope.ClientUnixMs);
+                transitMs = Math.Max(transitMs, stampedTransitMs);
+            }
+
+            return positionTicks + (transitMs * TimeSpan.TicksPerMillisecond);
         }
 
         private async Task HandleHeartbeatAsync(

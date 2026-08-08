@@ -3,7 +3,7 @@
     <TargetFramework>netstandard2.0</TargetFramework>
     <AssemblyName>Emby.SyncPlay</AssemblyName>
     <RootNamespace>Emby.SyncPlay</RootNamespace>
-    <Version>1.5.4</Version>
+    <Version>1.5.5</Version>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
     <AppendTargetFrameworkToOutputPath>true</AppendTargetFrameworkToOutputPath>
   </PropertyGroup>
