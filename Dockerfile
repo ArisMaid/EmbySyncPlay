@@ -13,16 +13,16 @@ RUN dotnet publish src/Emby.SyncPlay/Emby.SyncPlay.csproj -c Release --no-restor
 
 FROM amilys/embyserver:4.9.3.0
 COPY --from=build /out/Emby.SyncPlay.dll /system/plugins/Emby.SyncPlay.dll
-COPY docker/syncplay-loader.js /system/dashboard-ui/syncplay-loader-1.5.6.js
+COPY docker/syncplay-loader.js /system/dashboard-ui/syncplay-loader-1.5.7.js
 COPY docker/syncplay-init.sh /usr/local/bin/syncplay-init
 
 # amilys/embyserver exposes a RequireJS extension array in dashboard-ui/ext.js.
 # Add the plugin asset endpoint without replacing any extensions already configured.
-RUN sed -i '1a extmod.push("syncplay-loader-1.5.6");' /system/dashboard-ui/ext.js
+RUN sed -i '1a extmod.push("syncplay-loader-1.5.7");' /system/dashboard-ui/ext.js
 RUN chmod 755 /usr/local/bin/syncplay-init
 
 ENTRYPOINT ["/usr/local/bin/syncplay-init"]
 
 LABEL org.opencontainers.image.title="Emby SyncPlay" \
       org.opencontainers.image.description="Low-latency synchronized playback rooms for Emby Web" \
-      org.opencontainers.image.version="1.5.6"
+      org.opencontainers.image.version="1.5.7"

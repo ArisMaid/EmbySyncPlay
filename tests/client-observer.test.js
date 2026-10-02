@@ -572,9 +572,7 @@ test("HTTP fallback can issue controls after a stale media-loading banner", () =
     assert.match(sendControl, /mediaLoadBlocked/);
     assert.match(sendControl, /canControlDuringMediaLoad\(video\)/);
     assert.match(canControlDuringMediaLoad, /readyState\s*<\s*2/);
-    assert.match(canControlDuringMediaLoad, /expectedItemId/);
-    assert.match(canControlDuringMediaLoad, /expectedItemId\s*>\s*0/);
-    assert.doesNotMatch(canControlDuringMediaLoad, /expectedItemId\s*===\s*currentItemId/);
+    assert.match(canControlDuringMediaLoad, /isExpectedMedia\(video\)/);
 });
 
 test("playable media clears a stale loading barrier even without two buffered seconds", () => {

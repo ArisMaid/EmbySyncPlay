@@ -33,6 +33,7 @@ namespace Emby.SyncPlay.Core
         public string DeviceName { get; set; }
         public string Token { get; set; }
         public string ClientInstanceId { get; set; }
+        public HashSet<string> RetiredClientInstances { get; } = new HashSet<string>(StringComparer.Ordinal);
         public long LastClientSequence { get; set; }
         public long LastHeartbeatUnixMs { get; set; }
         public long PositionTicks { get; set; }

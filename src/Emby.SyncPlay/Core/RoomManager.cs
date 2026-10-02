@@ -495,6 +495,14 @@ namespace Emby.SyncPlay.Core
                 if (!string.IsNullOrWhiteSpace(envelope.ClientInstanceId) &&
                     !string.Equals(member.ClientInstanceId, envelope.ClientInstanceId, StringComparison.Ordinal))
                 {
+                    if (member.RetiredClientInstances.Contains(envelope.ClientInstanceId))
+                    {
+                        return false;
+                    }
+                    if (!string.IsNullOrEmpty(member.ClientInstanceId))
+                    {
+                        member.RetiredClientInstances.Add(member.ClientInstanceId);
+                    }
                     member.ClientInstanceId = envelope.ClientInstanceId;
                     member.LastClientSequence = 0;
                 }
@@ -791,6 +799,20 @@ namespace Emby.SyncPlay.Core
                             .ToList();
                         releaseCommand = ReleaseMediaLoadingBarrier(room, nowMs, "HeartbeatReady");
                     }
+                }
+
+                if (room.MediaTransitionState == MediaTransitionState.None &&
+                    room.State == RoomPlaybackState.Holding &&
+                    !string.Equals(room.HoldReason, "MediaSwitch", StringComparison.Ordinal) &&
+                    AllActiveMembersReady(room))
+                {
+                    room.State = room.StateBeforeHold == RoomPlaybackState.Paused
+                        ? RoomPlaybackState.Paused : RoomPlaybackState.Playing;
+                    room.ReferenceUnixMs = nowMs;
+                    room.Revision++;
+                    releaseSessionIds = room.Members.Values.Select(candidate => candidate.SessionId).ToList();
+                    releaseCommand = BuildCommand(room, room.State == RoomPlaybackState.Playing ? "Resume" : "Pause", member.SessionId, nowMs);
+                    releaseCommand.ExecuteAtUnixMs = nowMs + CalculateResumeLeadMs(room);
                 }
 
                 if (mediaStateChanged && releaseCommand == null)

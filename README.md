@@ -15,10 +15,13 @@
 
 从 [Releases](../../releases) 下载：
 
-- `EmbySyncPlay-1.5.6-amilys.zip`：推荐安装包，包含 DLL、Web 加载器和安装说明。
+- `EmbySyncPlay-1.5.7-amilys.zip`：推荐安装包，包含 DLL、Web 加载器和安装说明。
 - `Emby.SyncPlay.dll`：仅服务端组件，适用于已单独配置 Web 加载器的环境。
 
 Docker 用户也可直接构建：
+
+发布镜像（Linux amd64）：`ghcr.io/arismaid/embysyncplay:1.5.7`。
+镜像基于 `amilys/embyserver:4.9.3.0`；现有服务器版本高于此版本时，不要直接降级并复用配置，优先安装插件包。
 
 ```powershell
 docker compose up -d --build
@@ -32,11 +35,11 @@ docker compose up -d --build
 
 ```powershell
 .\scripts\build.ps1
-node --test tests/client-observer.test.js
+node --test tests/client*.test.js
 ```
 
 构建产物位于 `dist/Emby.SyncPlay.dll`。
 
 ## 当前版本
 
-`1.5.6`
+`1.5.7`

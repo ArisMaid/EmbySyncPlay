@@ -123,7 +123,7 @@
         const link = document.createElement("link");
         link.id = "syncPlay-client-css";
         link.rel = "stylesheet";
-        link.href = "/web/configurationpage?name=syncplayclientcss&v=1.5.6";
+        link.href = "/web/configurationpage?name=syncplayclientcss&v=1.5.7";
         document.head.appendChild(link);
     }
 
@@ -1160,6 +1160,7 @@
     function applyJoinResult(result) {
         const nextToken = getValue(result, "MemberToken", "memberToken");
         if (nextToken && nextToken !== state.memberToken) {
+            clearRoomState();
             state.clientSequence = 0;
             state.clientInstanceId = null;
         }
@@ -1311,6 +1312,7 @@
             return;
         }
         const mediaReady = isVideoReady(video);
+        if (!isExpectedMedia(video)) { return; }
         if (isLoadingNewMedia() && mediaReady) {
             return sendMediaReady(video);
         }
@@ -1332,10 +1334,11 @@
     function sendControl(kind, force) {
         const video = state.video;
         const mediaLoadBlocked = isLoadingNewMedia() && !canControlDuringMediaLoad(video);
-        if (!state.memberToken || !video || mediaLoadBlocked || (!force && performance.now() < state.suppressUntil)) {
+        if (!state.memberToken || !video || !isExpectedMedia(video) || mediaLoadBlocked || (!force && performance.now() < state.suppressUntil)) {
             return Promise.resolve(false);
         }
         state.localControlUntil = Math.max(state.localControlUntil, performance.now() + 3500);
+        cancelLoadAlignment();
         const payload = {
             EventId: createEventId(),
             ClientSequence: ++state.clientSequence,
@@ -1354,6 +1357,7 @@
     }
 
     function sendControlEvent(payload) {
+        const token = state.memberToken;
         return sendSocket("SyncPlayControl", payload).then(function (accepted) {
             if (accepted) {
                 return true;
@@ -1364,6 +1368,7 @@
             // response still carries the authoritative room snapshot.
             return new Promise(function (resolve) {
                 window.setTimeout(function () {
+                    if (state.memberToken !== token) { resolve(false); return; }
                     sendSocket("SyncPlayControl", payload).then(resolve);
                 }, 150);
             });
@@ -1372,7 +1377,7 @@
 
     function sendBuffering(isBuffering) {
         const video = state.video;
-        if (!state.memberToken || !video || isLocalSeekTransaction() || isLocalControlTransaction() || performance.now() < state.suppressUntil) {
+        if (!state.memberToken || !video || !isExpectedMedia(video) || isLocalSeekTransaction() || isLocalControlTransaction() || performance.now() < state.suppressUntil) {
             return Promise.resolve(false);
         }
         if (isLoadingNewMedia()) {
@@ -1396,7 +1401,7 @@
         if (!state.memberToken || !video || !isAwaitingMediaReady()) {
             return Promise.resolve(false);
         }
-        if (!isVideoReady(video)) {
+        if (!isVideoReady(video) || !isExpectedMedia(video)) {
             return Promise.resolve(false);
         }
         const now = performance.now();
@@ -1450,13 +1455,17 @@
         if (!video || video.readyState < 2) {
             return false;
         }
-        const expectedItemId = Number(getValue(state.room, "ItemId", "itemId") || state.expectedItemId || 0);
-        const currentItemId = getCurrentItemId();
-        // Emby's playback manager can keep exposing the previous item after
-        // the new video element already has current data. The room item is the
-        // authoritative event stamp, so a stale NowPlayingItem must not block
-        // local pause, play, or seek controls.
-        return expectedItemId > 0 || currentItemId > 0;
+        // Never infer loaded media identity from the room's desired item.
+        return isExpectedMedia(video);
+    }
+
+    function isExpectedMedia(video) {
+        if (!video || video !== state.video) { return false; }
+        const expected = Number(state.expectedItemId || getValue(state.room, "ItemId", "itemId") || 0);
+        // A source URL identifies the loaded stream even while Emby's metadata lags.
+        const match = /\/(?:videos|audio)\/(\d+)(?:\/|\?|$)/i.exec(video.currentSrc || video.src || "");
+        const actual = match ? Number(match[1]) : getCurrentItemId();
+        return expected > 0 && actual === expected;
     }
 
     function isVideoReady(video) {
@@ -1495,9 +1504,11 @@
             ClientInstanceId: getClientInstanceId()
         });
         const started = performance.now();
+        const requestToken = state.memberToken;
         const startedUnix = Date.now();
         return apiRequest("SyncPlay/Events", "POST", { MessageType: messageType, Data: eventPayload })
             .then(function (result) {
+                if (requestToken !== state.memberToken) { return false; }
                 const serverReceive = Number(getValue(result, "ServerReceiveUnixMs", "serverReceiveUnixMs") || 0);
                 const serverSend = Number(getValue(result, "ServerSendUnixMs", "serverSendUnixMs") || 0);
                 if (serverReceive > 0 && serverSend > 0) {
@@ -1523,6 +1534,7 @@
                 return accepted !== false;
             })
             .catch(function (error) {
+                if (requestToken !== state.memberToken) { return false; }
                 state.connectionOnline = false;
                 console.warn("[SyncPlay] HTTP event failed", messageType, {
                     elapsedMs: Math.round(performance.now() - started),
@@ -1671,6 +1683,8 @@
         if (!video || !state.memberToken || isLocalSeekTransaction() || isLocalControlTransaction()) {
             return;
         }
+
+        if (!isExpectedMedia(video)) { return; }
 
         const transition = getValue(room, "MediaTransitionState", "mediaTransitionState") || "None";
         if (transition !== "None" && video.readyState < 2) {
@@ -1990,6 +2004,7 @@
         const generation = ++state.loadAlignmentGeneration;
         const startedAt = performance.now();
         let stableChecks = 0;
+        let playbackApplied = false;
         const alignAfterSourceSettles = function () {
             if (generation !== state.loadAlignmentGeneration || video !== state.video) {
                 return;
@@ -2005,7 +2020,7 @@
                 stableChecks += 1;
             }
 
-            if (getValue(command, "State", "state") === "Playing") {
+            if (!playbackApplied && getValue(command, "State", "state") === "Playing") {
                 if (video.paused) {
                     state.suppressUntil = performance.now() + 800;
                     const playPromise = video.play();
@@ -2013,11 +2028,12 @@
                         playPromise.catch(function () {});
                     }
                 }
-            } else if (!video.paused) {
+            } else if (!playbackApplied && !video.paused) {
                 state.suppressUntil = performance.now() + 800;
                 video.pause();
                 restorePlaybackRate();
             }
+            playbackApplied = true;
 
             if (stableChecks < 4 && performance.now() - startedAt < 10000) {
                 window.setTimeout(alignAfterSourceSettles, 250);
