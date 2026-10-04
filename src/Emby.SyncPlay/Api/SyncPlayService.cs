@@ -51,7 +51,7 @@ namespace Emby.SyncPlay.Api
     }
 
     [Route("/SyncPlay/Events", "POST")]
-    public sealed class PostSyncPlayEventRequest : IReturn<bool>
+    public sealed class PostSyncPlayEventRequest : IReturn<SyncPlayEventResult>
     {
         public string MessageType { get; set; }
 
@@ -146,17 +146,31 @@ namespace Emby.SyncPlay.Api
             }
 
             var session = GetCurrentSession();
-            if (session.NowPlayingItem != null && long.TryParse(session.NowPlayingItem.Id, out var currentItemId))
+            var serverReceiveUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            // During a media transition Emby can still expose the previous
+            // NowPlayingItem while the browser is already loading the new
+            // item. Preserve the client's epoch/item stamp when it has one;
+            // only fill a missing stamp from the session as a compatibility
+            // fallback for older clients.
+            if (request.Data.ItemId <= 0 && session.NowPlayingItem != null &&
+                long.TryParse(session.NowPlayingItem.Id, out var currentItemId))
             {
                 request.Data.ItemId = currentItemId;
             }
 
-            await SyncPlayRuntime.Rooms.ProcessSocketMessageAsync(
+            var accepted = await SyncPlayRuntime.Rooms.ProcessSocketMessageAsync(
                     request.MessageType,
                     request.Data,
                     CancellationToken.None)
                 .ConfigureAwait(false);
-            return true;
+            var roomStatus = SyncPlayRuntime.Rooms.GetStatus(session.Id);
+            return new SyncPlayEventResult
+            {
+                Accepted = accepted && roomStatus != null,
+                ServerReceiveUnixMs = serverReceiveUnixMs,
+                ServerSendUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                Room = roomStatus?.Room
+            };
         }
 
         private SessionInfo GetCurrentSession()

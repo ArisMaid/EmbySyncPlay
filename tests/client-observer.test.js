@@ -505,12 +505,13 @@ test("media switching preserves membership and reports epoch-scoped readiness", 
     const bindCurrentVideo = extractFunction(source, "bindCurrentVideo");
     const sendMediaReady = extractFunction(source, "sendMediaReady");
     const applyCommand = extractFunction(source, "applyCommand");
+    const isCommandObsolete = extractFunction(source, "isCommandObsolete");
 
     assert.doesNotMatch(bindCurrentVideo, /ended:\s*function\s*\(\)\s*\{\s*leaveRoom\(\)/);
     assert.match(sendMediaReady, /SyncPlayMediaReady/);
     assert.match(sendMediaReady, /MediaEpoch:\s*state\.mediaEpoch/);
-    assert.match(sendMediaReady, /ItemId:\s*getCurrentItemId\(\)/);
-    assert.match(applyCommand, /commandEpoch\s*<\s*state\.mediaEpoch/);
+    assert.match(sendMediaReady, /ItemId:\s*getEventItemId\(\)/);
+    assert.match(isCommandObsolete, /commandEpoch\s*<\s*state\.mediaEpoch/);
     assert.match(applyCommand, /state\.mediaSwitchLoading\s*=\s*true/);
 });
 
@@ -541,6 +542,132 @@ test("local seek transaction suppresses heartbeat and buffering races", () => {
     assert.match(source, /!video\.seeking && !isLocalSeekTransaction\(\)/);
     assert.match(source, /!state\.memberToken \|\| !video \|\| isLocalSeekTransaction\(\)/);
     assert.match(source, /state\.loadAlignmentGeneration \+= 1/);
+});
+
+test("HTTP room-state polling provides a WebSocket-independent sync fallback", () => {
+    const clientPath = path.join(__dirname, "..", "src", "Emby.SyncPlay", "Web", "client.js");
+    const source = fs.readFileSync(clientPath, "utf8");
+    const startRealtime = extractFunction(source, "startRealtime");
+    const pollRoomState = extractFunction(source, "pollRoomState");
+    const getStatusPath = extractFunction(source, "getStatusPath");
+    const applyRoomState = extractFunction(source, "applyRoomState");
+    const sendSocket = extractFunction(source, "sendSocket");
+
+    assert.match(startRealtime, /statusTimer/);
+    assert.match(startRealtime, /pollRoomState\(\)/);
+    assert.match(getStatusPath, /SyncPlay\/Status/);
+    assert.match(pollRoomState, /recordClockSample/);
+    assert.match(applyRoomState, /buildRoomCommand\(room, "Load"\)/);
+    assert.match(applyRoomState, /reconcileRoomPlayback\(room/);
+    assert.match(sendSocket, /applyRoomState\(room, "http-event"\)/);
+    assert.match(sendSocket, /ServerReceiveUnixMs/);
+});
+
+test("HTTP fallback can issue controls after a stale media-loading banner", () => {
+    const clientPath = path.join(__dirname, "..", "src", "Emby.SyncPlay", "Web", "client.js");
+    const source = fs.readFileSync(clientPath, "utf8");
+    const sendControl = extractFunction(source, "sendControl");
+    const canControlDuringMediaLoad = extractFunction(source, "canControlDuringMediaLoad");
+
+    assert.match(sendControl, /mediaLoadBlocked/);
+    assert.match(sendControl, /canControlDuringMediaLoad\(video\)/);
+    assert.match(canControlDuringMediaLoad, /readyState\s*<\s*2/);
+    assert.match(canControlDuringMediaLoad, /isExpectedMedia\(video\)/);
+});
+
+test("playable media clears a stale loading barrier even without two buffered seconds", () => {
+    const clientPath = path.join(__dirname, "..", "src", "Emby.SyncPlay", "Web", "client.js");
+    const source = fs.readFileSync(clientPath, "utf8");
+    const isVideoReady = extractFunction(source, "isVideoReady");
+    const sendHeartbeat = extractFunction(source, "sendHeartbeat");
+    const markReady = extractFunction(source, "markReadyAfterInitialLoad");
+
+    assert.match(isVideoReady, /readyState\s*>=\s*3/);
+    assert.match(isVideoReady, /bufferedAhead\(video\)/);
+    assert.match(sendHeartbeat, /const mediaReady = isVideoReady\(video\)/);
+    assert.match(markReady, /isVideoReady\(video\)/);
+});
+
+test("media events prefer the room item while Emby reports a stale NowPlayingItem", () => {
+    const clientPath = path.join(__dirname, "..", "src", "Emby.SyncPlay", "Web", "client.js");
+    const source = fs.readFileSync(clientPath, "utf8");
+    const getEventItemId = extractFunction(source, "getEventItemId");
+    const sendMediaReady = extractFunction(source, "sendMediaReady");
+    const sendControl = extractFunction(source, "sendControl");
+    const sendHeartbeat = extractFunction(source, "sendHeartbeat");
+
+    assert.match(getEventItemId, /expectedItemId/);
+    assert.match(getEventItemId, /currentItemId !== expectedItemId/);
+    assert.match(sendMediaReady, /ItemId: getEventItemId\(\)/);
+    assert.match(sendControl, /ItemId: getEventItemId\(\)/);
+    assert.match(sendHeartbeat, /ItemId: getEventItemId\(\)/);
+});
+
+test("HTTP status requests bypass intermediary caches", () => {
+    const clientPath = path.join(__dirname, "..", "src", "Emby.SyncPlay", "Web", "client.js");
+    const source = fs.readFileSync(clientPath, "utf8");
+    const getStatusPath = extractFunction(source, "getStatusPath");
+    const apiRequest = extractFunction(source, "apiRequest");
+
+    assert.match(getStatusPath, /syncplayClientTime/);
+    assert.match(apiRequest, /Cache-Control/);
+    assert.match(apiRequest, /no-cache/);
+});
+
+test("stale media-switch commands cannot recreate the loading banner", () => {
+    const clientPath = path.join(__dirname, "..", "src", "Emby.SyncPlay", "Web", "client.js");
+    const source = fs.readFileSync(clientPath, "utf8");
+    const applyCommand = extractFunction(source, "applyCommand");
+    const isCommandObsolete = extractFunction(source, "isCommandObsolete");
+    const revisionCheck = isCommandObsolete.indexOf("commandRevision && roomRevision && commandRevision < roomRevision");
+    const mediaSwitchMutation = applyCommand.indexOf('state.mediaSwitchLoading = true');
+
+    assert.ok(revisionCheck >= 0);
+    assert.ok(mediaSwitchMutation >= 0);
+    assert.match(applyCommand, /isCommandObsolete\(command\)/);
+});
+
+test("new playback commands cancel an older load-alignment loop", () => {
+    const clientPath = path.join(__dirname, "..", "src", "Emby.SyncPlay", "Web", "client.js");
+    const source = fs.readFileSync(clientPath, "utf8");
+    const executeCommand = extractFunction(source, "executeCommand");
+    const cancelLoadAlignment = extractFunction(source, "cancelLoadAlignment");
+
+    assert.match(executeCommand, /kind !== "Load"/);
+    assert.match(executeCommand, /preservesMediaSwitchLoad/);
+    assert.match(executeCommand, /cancelLoadAlignment\(\)/);
+    assert.match(cancelLoadAlignment, /loadAlignmentGeneration\s*\+=\s*1/);
+    assert.match(cancelLoadAlignment, /lastLoadCommand\s*=\s*null/);
+});
+
+test("HTTP status exposes readiness for initial joins and retries MediaReady without a WebSocket", () => {
+    const clientPath = path.join(__dirname, "..", "src", "Emby.SyncPlay", "Web", "client.js");
+    const source = fs.readFileSync(clientPath, "utf8");
+    const sendMediaReady = extractFunction(source, "sendMediaReady");
+    const isAwaitingMediaReady = extractFunction(source, "isAwaitingMediaReady");
+    const isLoadingNewMedia = extractFunction(source, "isLoadingNewMedia");
+    const applyRoomState = extractFunction(source, "applyRoomState");
+
+    assert.match(sendMediaReady, /isAwaitingMediaReady\(\)/);
+    assert.match(sendMediaReady, /IsActive: isActive/);
+    assert.match(isAwaitingMediaReady, /IsCurrentMemberMediaReady/);
+    assert.match(isLoadingNewMedia, /IsCurrentMemberMediaLoading/);
+    assert.match(isAwaitingMediaReady, /isLoadingNewMedia\(\)/);
+    assert.match(applyRoomState, /IsCurrentMemberActive/);
+});
+
+test("HTTP reconciliation yields to a local play, pause, or seek request", () => {
+    const clientPath = path.join(__dirname, "..", "src", "Emby.SyncPlay", "Web", "client.js");
+    const source = fs.readFileSync(clientPath, "utf8");
+    const sendControl = extractFunction(source, "sendControl");
+    const sendControlEvent = extractFunction(source, "sendControlEvent");
+    const reconcileRoomPlayback = extractFunction(source, "reconcileRoomPlayback");
+
+    assert.match(sendControl, /localControlUntil/);
+    assert.match(sendControl, /sendControlEvent\(payload\)/);
+    assert.match(sendControlEvent, /same sequence and EventId/);
+    assert.match(sendControlEvent, /setTimeout/);
+    assert.match(reconcileRoomPlayback, /isLocalControlTransaction\(\)/);
 });
 
 test("Load command delegates to source-settling alignment", () => {

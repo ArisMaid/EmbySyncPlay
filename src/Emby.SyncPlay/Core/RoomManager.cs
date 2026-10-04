@@ -468,7 +468,7 @@ namespace Emby.SyncPlay.Core
             return Result(true, false, false, beginTransition ? "HostMediaTransitionStarted" : "ExpectedMediaStarted", resultEpoch);
         }
 
-        public async Task ProcessSocketMessageAsync(
+        public async Task<bool> ProcessSocketMessageAsync(
             string messageType,
             SyncPlaySocketEnvelope envelope,
             CancellationToken cancellationToken)
@@ -477,7 +477,7 @@ namespace Emby.SyncPlay.Core
                 !_tokens.TryGetValue(envelope.MemberToken, out var membership) ||
                 !_rooms.TryGetValue(membership.RoomCode, out var room))
             {
-                return;
+                return false;
             }
 
             SyncPlayMember member;
@@ -486,7 +486,25 @@ namespace Emby.SyncPlay.Core
                 if (!room.Members.TryGetValue(membership.SessionId, out member) ||
                     !string.Equals(member.Token, envelope.MemberToken, StringComparison.Ordinal))
                 {
-                    return;
+                    return false;
+                }
+
+                // A browser reload keeps the room membership token but starts
+                // its sequence counter from zero. Scope the counter to a page
+                // instance so reconnecting cannot make every control stale.
+                if (!string.IsNullOrWhiteSpace(envelope.ClientInstanceId) &&
+                    !string.Equals(member.ClientInstanceId, envelope.ClientInstanceId, StringComparison.Ordinal))
+                {
+                    if (member.RetiredClientInstances.Contains(envelope.ClientInstanceId))
+                    {
+                        return false;
+                    }
+                    if (!string.IsNullOrEmpty(member.ClientInstanceId))
+                    {
+                        member.RetiredClientInstances.Add(member.ClientInstanceId);
+                    }
+                    member.ClientInstanceId = envelope.ClientInstanceId;
+                    member.LastClientSequence = 0;
                 }
             }
 
@@ -494,19 +512,17 @@ namespace Emby.SyncPlay.Core
             {
                 case "SyncPlayClockPing":
                     await SendClockPongAsync(member, envelope, cancellationToken).ConfigureAwait(false);
-                    break;
+                    return true;
                 case "SyncPlayControl":
-                    await HandleControlAsync(room, member, envelope, cancellationToken).ConfigureAwait(false);
-                    break;
+                    return await HandleControlAsync(room, member, envelope, cancellationToken).ConfigureAwait(false);
                 case "SyncPlayHeartbeat":
-                    await HandleHeartbeatAsync(room, member, envelope, cancellationToken).ConfigureAwait(false);
-                    break;
+                    return await HandleHeartbeatAsync(room, member, envelope, cancellationToken).ConfigureAwait(false);
                 case "SyncPlayBuffering":
-                    await HandleBufferingAsync(room, member, envelope, cancellationToken).ConfigureAwait(false);
-                    break;
+                    return await HandleBufferingAsync(room, member, envelope, cancellationToken).ConfigureAwait(false);
                 case "SyncPlayMediaReady":
-                    await HandleMediaReadyAsync(room, member, envelope, cancellationToken).ConfigureAwait(false);
-                    break;
+                    return await HandleMediaReadyAsync(room, member, envelope, cancellationToken).ConfigureAwait(false);
+                default:
+                    return false;
             }
         }
 
@@ -622,7 +638,7 @@ namespace Emby.SyncPlay.Core
             return removed;
         }
 
-        private async Task HandleControlAsync(
+        private async Task<bool> HandleControlAsync(
             SyncPlayRoom room,
             SyncPlayMember member,
             SyncPlaySocketEnvelope envelope,
@@ -634,23 +650,37 @@ namespace Emby.SyncPlay.Core
                 if (room.MediaTransitionState != MediaTransitionState.None ||
                     !IsEnvelopeForCurrentMedia(room, envelope))
                 {
-                    return;
+                    return false;
                 }
 
                 if (envelope.ClientSequence <= member.LastClientSequence)
                 {
-                    return;
+                    return false;
                 }
 
                 member.LastClientSequence = envelope.ClientSequence;
                 if (!Enum.TryParse(envelope.Kind, true, out SyncControlKind kind))
                 {
-                    return;
+                    return false;
                 }
 
                 if (room.State == RoomPlaybackState.Holding && kind == SyncControlKind.Play)
                 {
-                    return;
+                    return false;
+                }
+
+                // A client can reach a playable video before its Ready
+                // heartbeat (or MediaReady event) crosses a WebSocket-less
+                // proxy. A valid control for the current epoch proves that the
+                // member has usable media, so clear a stale initial loading
+                // barrier while accepting the control.
+                if (room.MediaTransitionState == MediaTransitionState.None)
+                {
+                    member.IsMediaLoading = false;
+                    member.IsMediaReady = true;
+                    member.MediaLoadTimedOut = false;
+                    member.IsReady = true;
+                    member.IsActive = true;
                 }
 
                 var nowMs = _clock.UnixTimeMilliseconds;
@@ -678,6 +708,7 @@ namespace Emby.SyncPlay.Core
 
             await BroadcastCommandAsync(room, command, member.SessionId, cancellationToken).ConfigureAwait(false);
             await BroadcastStateAsync(room, cancellationToken).ConfigureAwait(false);
+            return true;
         }
 
         private static long EstimateControlPositionTicks(
@@ -703,18 +734,21 @@ namespace Emby.SyncPlay.Core
             return positionTicks + (transitMs * TimeSpan.TicksPerMillisecond);
         }
 
-        private async Task HandleHeartbeatAsync(
+        private async Task<bool> HandleHeartbeatAsync(
             SyncPlayRoom room,
             SyncPlayMember member,
             SyncPlaySocketEnvelope envelope,
             CancellationToken cancellationToken)
         {
             SyncPlayCommand correction = null;
+            SyncPlayCommand releaseCommand = null;
+            List<string> releaseSessionIds = null;
+            var mediaStateChanged = false;
             lock (room.Gate)
             {
                 if (!IsEnvelopeForCurrentMedia(room, envelope))
                 {
-                    return;
+                    return false;
                 }
 
                 var nowMs = _clock.UnixTimeMilliseconds;
@@ -726,6 +760,65 @@ namespace Emby.SyncPlay.Core
                 member.IsActive = envelope.IsActive;
                 member.RoundTripTimeMs = Math.Max(0, envelope.RoundTripTimeMs);
                 room.LastActivityAt = _clock.UtcNow;
+
+                // A Ready heartbeat is sufficient to complete the initial
+                // join handshake. Older clients did not send MediaReady when
+                // the room transition state was None, which left the member
+                // permanently marked as loading even though playback worked.
+                if (envelope.IsReady && !envelope.IsBuffering &&
+                    room.MediaTransitionState == MediaTransitionState.None &&
+                    (!member.IsMediaReady || member.IsMediaLoading || member.MediaLoadTimedOut))
+                {
+                    member.IsMediaReady = true;
+                    member.IsMediaLoading = false;
+                    member.MediaLoadTimedOut = false;
+                    // Older clients sent IsActive=false while clearing the
+                    // initial join loading flag. Once the room is out of a
+                    // media transition, a buffered Ready heartbeat is an
+                    // active playback participant.
+                    member.IsActive = true;
+                    mediaStateChanged = true;
+                }
+
+                // If a custom MediaReady message was lost by a WebSocket
+                // proxy, promote a ready heartbeat while a media barrier is
+                // active and release it as soon as every member is ready.
+                if (envelope.IsReady && !envelope.IsBuffering &&
+                    room.MediaTransitionState == MediaTransitionState.LoadingMembers &&
+                    (!member.IsMediaReady || member.IsMediaLoading || member.MediaLoadTimedOut))
+                {
+                    member.IsMediaReady = true;
+                    member.IsMediaLoading = false;
+                    member.MediaLoadTimedOut = false;
+                    mediaStateChanged = true;
+                    if (AllMediaMembersReady(room))
+                    {
+                        releaseSessionIds = room.Members.Values
+                            .Where(candidate => candidate.IsMediaReady)
+                            .Select(candidate => candidate.SessionId)
+                            .ToList();
+                        releaseCommand = ReleaseMediaLoadingBarrier(room, nowMs, "HeartbeatReady");
+                    }
+                }
+
+                if (room.MediaTransitionState == MediaTransitionState.None &&
+                    room.State == RoomPlaybackState.Holding &&
+                    !string.Equals(room.HoldReason, "MediaSwitch", StringComparison.Ordinal) &&
+                    AllActiveMembersReady(room))
+                {
+                    room.State = room.StateBeforeHold == RoomPlaybackState.Paused
+                        ? RoomPlaybackState.Paused : RoomPlaybackState.Playing;
+                    room.ReferenceUnixMs = nowMs;
+                    room.Revision++;
+                    releaseSessionIds = room.Members.Values.Select(candidate => candidate.SessionId).ToList();
+                    releaseCommand = BuildCommand(room, room.State == RoomPlaybackState.Playing ? "Resume" : "Pause", member.SessionId, nowMs);
+                    releaseCommand.ExecuteAtUnixMs = nowMs + CalculateResumeLeadMs(room);
+                }
+
+                if (mediaStateChanged && releaseCommand == null)
+                {
+                    room.Revision++;
+                }
 
                 var expectedTicks = room.EstimatePositionTicks(nowMs);
                 member.DriftMs = (int)((member.PositionTicks - expectedTicks) / TimeSpan.TicksPerMillisecond);
@@ -744,14 +837,28 @@ namespace Emby.SyncPlay.Core
                 }
             }
 
+            if (releaseCommand != null)
+            {
+                await Task.WhenAll(releaseSessionIds.Select(id =>
+                    _commandSink.SendAsync(id, "SyncPlayCommand", releaseCommand, cancellationToken)))
+                    .ConfigureAwait(false);
+            }
+
+            if (mediaStateChanged || releaseCommand != null)
+            {
+                await BroadcastStateAsync(room, cancellationToken).ConfigureAwait(false);
+            }
+
             if (correction != null)
             {
                 await _commandSink.SendAsync(member.SessionId, "SyncPlayCommand", correction, cancellationToken)
                     .ConfigureAwait(false);
             }
+
+            return true;
         }
 
-        private async Task HandleBufferingAsync(
+        private async Task<bool> HandleBufferingAsync(
             SyncPlayRoom room,
             SyncPlayMember member,
             SyncPlaySocketEnvelope envelope,
@@ -762,7 +869,7 @@ namespace Emby.SyncPlay.Core
             {
                 if (!IsEnvelopeForCurrentMedia(room, envelope))
                 {
-                    return;
+                    return false;
                 }
 
                 member.IsBuffering = envelope.IsBuffering;
@@ -802,9 +909,10 @@ namespace Emby.SyncPlay.Core
             }
 
             await BroadcastStateAsync(room, cancellationToken).ConfigureAwait(false);
+            return true;
         }
 
-        private async Task HandleMediaReadyAsync(
+        private async Task<bool> HandleMediaReadyAsync(
             SyncPlayRoom room,
             SyncPlayMember member,
             SyncPlaySocketEnvelope envelope,
@@ -816,9 +924,10 @@ namespace Emby.SyncPlay.Core
             List<string> releaseSessionIds = null;
             lock (room.Gate)
             {
-                if (envelope.MediaEpoch != room.MediaEpoch || envelope.ItemId != room.ItemId)
+                if ((envelope.MediaEpoch > 0 && envelope.MediaEpoch != room.MediaEpoch) ||
+                    (envelope.ItemId > 0 && envelope.ItemId != room.ItemId))
                 {
-                    return;
+                    return false;
                 }
 
                 member.MediaEpoch = room.MediaEpoch;
@@ -872,6 +981,7 @@ namespace Emby.SyncPlay.Core
             }
 
             await BroadcastStateAsync(room, cancellationToken).ConfigureAwait(false);
+            return true;
         }
 
         private async Task TryCompleteMediaLoadingAsync(
@@ -995,6 +1105,7 @@ namespace Emby.SyncPlay.Core
         private RoomDto MapRoom(SyncPlayRoom room, string requestingSessionId)
         {
             var nowMs = _clock.UnixTimeMilliseconds;
+            room.Members.TryGetValue(requestingSessionId ?? string.Empty, out var currentMember);
             return new RoomDto
             {
                 Code = room.Code,
@@ -1011,6 +1122,9 @@ namespace Emby.SyncPlay.Core
                 HoldReason = room.HoldReason,
                 ReadyMemberCount = room.Members.Values.Count(member => member.IsMediaReady),
                 LoadingMemberCount = room.Members.Values.Count(member => member.IsMediaLoading),
+                IsCurrentMemberMediaLoading = currentMember?.IsMediaLoading ?? false,
+                IsCurrentMemberMediaReady = currentMember?.IsMediaReady ?? false,
+                IsCurrentMemberActive = currentMember?.IsActive ?? false,
                 IsCreator = string.Equals(room.CreatorSessionId, requestingSessionId, StringComparison.OrdinalIgnoreCase),
                 MemberCount = room.Members.Count,
                 Members = room.Members.Values
